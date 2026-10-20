@@ -6,6 +6,20 @@ gamble-on-first-join: true
 # 0 = off. Scale / neutral stats are never affected.
 pity-strength: 2.0
 
+# Block interaction range = entity interaction range + a random bonus in this range.
+block-reach-bonus:
+  min: 0.5
+  max: 1.0
+  # If entity reach is above normal (3.0), the bonus is multiplied by this (0.5 = 50% less).
+  above-normal-multiplier: 0.5
+
+# Size bonus: if a player's scale is above 1.0, movement speed gets an extra
+# bonus on top of its roll. The bonus is smaller if the speed roll is already
+# above normal. (0.10 = +10%.) Set both to 0 to disable.
+scale-speed-bonus:
+  speed-at-or-below-normal: 0.10
+  speed-above-normal: 0.05
+
 # Jump guarantee: if the rolled gravity + jump_strength give a jump peak lower
 # than this many blocks, step_height is automatically raised to 1.0 so the
 # player can always climb a full block.
@@ -26,6 +40,8 @@ groups:
 #  kind ADD  : min/max are added to normal (block_interaction_range: +/-1 block)
 #  good: high | low | neutral
 #     high/low  -> counts towards group balance and the pity system
+#     center    -> best at normal (x1.0), worse the further away either way;
+#                  counts for the pity system but not the group balance sum
 #     neutral   -> rolled independently, ignored by balance + pity (like scale)
 stats:
   # --- combat group (balanced, +/-5% net) ---
@@ -34,12 +50,13 @@ stats:
   attack_damage:            { min: 0.5, max: 1.5, good: high }
   max_health:               { min: 0.5, max: 1.5, good: high }
 
+  # block_interaction_range is not rolled: it is entity_interaction_range plus block-reach-bonus.
+
   # --- mobility group (range of 1 around normal, balanced +/-15% net) ---
   gravity:                  { min: 0.1,  max: 2.0, good: low }    # normal +/- 1.0, floored at 0.1
   jump_strength:            { min: 0.1,  max: 2.0, good: high }
   movement_speed:           { min: 0.25, max: 2.0, good: high }
-  block_interaction_range:  { min: -1.0, max: 1.0, good: high }
-  friction_modifier:        { min: 0.25, max: 2.0, good: neutral } # needs a 26.2+ server
+  friction_modifier:        { min: 0.8, max: 1.2, good: center }  # closer to 1.0 is better; needs a 26.2+ server
   scale:                    { min: 0.75, max: 1.25, good: neutral }
 
   # --- independent ---
