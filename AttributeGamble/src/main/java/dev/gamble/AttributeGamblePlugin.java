@@ -221,7 +221,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             case ABS -> new AttributeModifier(key, v - base, AttributeModifier.Operation.ADD_NUMBER);
             case ADD -> new AttributeModifier(key, v, AttributeModifier.Operation.ADD_NUMBER);
         };
-        inst.addPermanentModifier(mod);
+        inst.addModifier(mod);
     }
 
     // ------------------------------------------------------------------ randomness / pity
@@ -423,7 +423,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         if (peak < min) {
             double need = 1.0 - step.getBaseValue();
             if (need > 0) {
-                step.addPermanentModifier(new AttributeModifier(key, need, AttributeModifier.Operation.ADD_NUMBER));
+                step.addModifier(new AttributeModifier(key, need, AttributeModifier.Operation.ADD_NUMBER));
             }
         }
     }
