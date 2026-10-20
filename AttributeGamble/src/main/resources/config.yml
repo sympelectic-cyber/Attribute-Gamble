@@ -1,0 +1,47 @@
+# Auto-gamble players who join the server for the first time.
+gamble-on-first-join: true
+
+# "Pity" system: if the stats rolled so far are low on the good side, later
+# stats (and the net balance of each group) are skewed towards better rolls.
+# 0 = off. Scale / neutral stats are never affected.
+pity-strength: 2.0
+
+# Jump guarantee: if the rolled gravity + jump_strength give a jump peak lower
+# than this many blocks, step_height is automatically raised to 1.0 so the
+# player can always climb a full block.
+min-jump-height: 1.05
+
+# Balance groups. The net sum of the percentage deviations from normal of all
+# non-neutral stats in a group must stay within +/- tolerance.
+# (0.05 = the group's stats add up to between -5% and +5%)
+groups:
+  combat:
+    tolerance: 0.05
+  mobility:
+    tolerance: 0.15
+
+# Per-stat ranges.
+#  kind MULT : min/max are multipliers of normal (1.0 = normal)
+#  entity_interaction_range : min/max are ABSOLUTE values (normal = 3.0)
+#  kind ADD  : min/max are added to normal (block_interaction_range: +/-1 block)
+#  good: high | low | neutral
+#     high/low  -> counts towards group balance and the pity system
+#     neutral   -> rolled independently, ignored by balance + pity (like scale)
+stats:
+  # --- combat group (balanced, +/-5% net) ---
+  entity_interaction_range: { min: 3.0, max: 5.0, good: high }
+  attack_speed:             { min: 0.5, max: 1.5, good: high }
+  attack_damage:            { min: 0.5, max: 1.5, good: high }
+  max_health:               { min: 0.5, max: 1.5, good: high }
+
+  # --- mobility group (range of 1 around normal, balanced +/-15% net) ---
+  gravity:                  { min: 0.1,  max: 2.0, good: low }    # normal +/- 1.0, floored at 0.1
+  jump_strength:            { min: 0.1,  max: 2.0, good: high }
+  movement_speed:           { min: 0.25, max: 2.0, good: high }
+  block_interaction_range:  { min: -1.0, max: 1.0, good: high }
+  friction_modifier:        { min: 0.25, max: 2.0, good: neutral } # needs a 26.2+ server
+  scale:                    { min: 0.75, max: 1.25, good: neutral }
+
+  # --- independent ---
+  oxygen_bonus:             { min: 0.0, max: 5.0, good: high }
+  water_movement_efficiency: { min: 0.0, max: 1.0, good: high }  # vanilla caps this at 1.0
