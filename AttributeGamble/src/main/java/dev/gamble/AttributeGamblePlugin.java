@@ -15,6 +15,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.*;
@@ -25,7 +26,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     /** MULT: factor of normal. ABS: absolute final value. ADD: flat amount added to normal. */
     enum Kind { MULT, ABS, ADD }
 
-    enum Good { HIGH, LOW, NEUTRAL }
+    /** HIGH/LOW: better at that end. CENTER: best at normal (x1.0), worse further away either side. NEUTRAL: ignored. */
+    enum Good { HIGH, LOW, CENTER, NEUTRAL }
 
     static final class Stat {
         final String id;
@@ -37,6 +39,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         Attribute attr;              // null if this server doesn't have the attribute
         double lo, hi;
         Good good;
+        String linkedTo;             // if set, this stat copies another stat's final value instead of rolling
 
         Stat(String id, String group, Kind kind, double lo, double hi, Good good) {
             this.id = id;
@@ -49,7 +52,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
         /** Takes part in a group's balance sum. */
         boolean counted() {
-            return group != null && good != Good.NEUTRAL && attr != null;
+            return group != null && (good == Good.HIGH || good == Good.LOW) && attr != null;
         }
 
         double sign() {
@@ -84,8 +87,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         stats.add(new Stat("gravity", "mobility", Kind.MULT, 0.1, 2.0, Good.LOW));
         stats.add(new Stat("jump_strength", "mobility", Kind.MULT, 0.1, 2.0, Good.HIGH));
         stats.add(new Stat("movement_speed", "mobility", Kind.MULT, 0.25, 2.0, Good.HIGH));
-        stats.add(new Stat("block_interaction_range", "mobility", Kind.ADD, -1.0, 1.0, Good.HIGH));
-        stats.add(new Stat("friction_modifier", "mobility", Kind.MULT, 0.25, 2.0, Good.NEUTRAL));
+        Stat block = new Stat("block_interaction_range", null, Kind.ADD, 0.0, 0.0, Good.HIGH);
+        block.linkedTo = "entity_interaction_range"; // both reaches are always the same
+        stats.add(block);
+        stats.add(new Stat("friction_modifier", "mobility", Kind.MULT, 0.8, 1.2, Good.CENTER));
         stats.add(new Stat("scale", "mobility", Kind.MULT, 0.75, 1.25, Good.NEUTRAL));
 
         stats.add(new Stat("oxygen_bonus", null, Kind.ADD, 0.0, 5.0, Good.HIGH));
@@ -118,6 +123,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
     private List<Stat> available() {
         return stats.stream().filter(s -> s.attr != null).toList();
+    }
+
+    /** Stats that are rolled on their own (everything except linked stats). */
+    private List<Stat> rollable() {
+        return stats.stream().filter(s -> s.attr != null && s.linkedTo == null).toList();
     }
 
     private List<Stat> members(String group) {
@@ -233,6 +243,12 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     /** -1 (worst end of the range) .. +1 (best end of the range). */
     private double pos(Stat s, double v) {
         if (s.hi <= s.lo) return 0;
+        if (s.good == Good.CENTER) {
+            double n = neutral(s, 1.0);
+            double maxDist = Math.max(Math.abs(s.lo - n), Math.abs(s.hi - n));
+            if (maxDist <= 0) return 1.0;
+            return (1.0 - Math.min(1.0, Math.abs(v - n) / maxDist)) * 2.0 - 1.0;
+        }
         double t = (v - s.lo) / (s.hi - s.lo);
         t = Math.max(0, Math.min(1, t));
         return (s.good == Good.LOW ? 1.0 - t : t) * 2.0 - 1.0;
@@ -245,6 +261,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     /** Draws a value; pity > 0 skews it towards the good end of the range. */
     private double draw(Stat s, double pity) {
         double u = rand();
+        if (s.good == Good.CENTER) {
+            double v = s.lo + u * (s.hi - s.lo);
+            double f = pity / (1.0 + pity);          // pity pulls the roll towards normal
+            return v + (neutral(s, 1.0) - v) * f;
+        }
         if (pity > 0 && s.good != Good.NEUTRAL) u = Math.pow(u, 1.0 / (1.0 + pity));
         return s.good == Good.LOW ? s.hi - u * (s.hi - s.lo) : s.lo + u * (s.hi - s.lo);
     }
@@ -326,7 +347,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     // ------------------------------------------------------------------ rolling
 
     private void rollAll(Player p) {
-        List<Stat> order = new ArrayList<>(available());
+        List<Stat> order = new ArrayList<>(rollable());
         Collections.shuffle(order);
 
         Map<Stat, Double> vals = new LinkedHashMap<>();
@@ -348,14 +369,16 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
 
         for (var e : vals.entrySet()) applyStat(p, e.getKey(), e.getValue());
+        rerollLinkOffsets(p);
         finish(p);
     }
 
     private void rollOne(Player p, Stat st) {
+        if (st.linkedTo != null) st = findStat(st.linkedTo); // rerolling one reach rerolls both
         // pity from the player's other (non-neutral) stats
         double posSum = 0;
         int posN = 0;
-        for (Stat o : available()) {
+        for (Stat o : rollable()) {
             if (o == st || o.good == Good.NEUTRAL) continue;
             posSum += pos(o, current(p, o));
             posN++;
@@ -372,10 +395,13 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         } else {
             applyStat(p, st, v);
         }
+        final String rolledId = st.id;
+        if (stats.stream().anyMatch(o -> rolledId.equals(o.linkedTo))) rerollLinkOffsets(p);
         finish(p);
     }
 
     private void resetPlayer(Player p) {
+        clearLinkOffsets(p);
         for (Stat s : available()) {
             AttributeInstance inst = p.getAttribute(s.attr);
             if (inst == null) continue;
@@ -387,9 +413,96 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
     /** Jump guarantee + heal. */
     private void finish(Player p) {
+        linkStats(p);
+        applyScaleBonus(p);
         fixJump(p);
         AttributeInstance hp = p.getAttribute(Attribute.MAX_HEALTH);
         if (hp != null) p.setHealth(hp.getValue());
+    }
+
+    /** Stored bonus a linked stat gets on top of its source (e.g. block reach = entity reach + 0.5..1.0). */
+    private double linkOffset(Player p, Stat s, boolean reroll) {
+        NamespacedKey key = keyFor("offset_" + s.id);
+        var pdc = p.getPersistentDataContainer();
+        Double stored = pdc.get(key, PersistentDataType.DOUBLE);
+        if (stored == null || reroll) {
+            double lo = getConfig().getDouble("block-reach-bonus.min", 0.5);
+            double hi = getConfig().getDouble("block-reach-bonus.max", 1.0);
+            if (hi < lo) { double tmp = lo; lo = hi; hi = tmp; }
+            stored = Math.round(uniform(lo, hi) * 100.0) / 100.0;
+            pdc.set(key, PersistentDataType.DOUBLE, stored);
+        }
+        return stored;
+    }
+
+    private double uniform(double lo, double hi) {
+        return hi <= lo ? lo : lo + rand() * (hi - lo);
+    }
+
+    private void rerollLinkOffsets(Player p) {
+        for (Stat s : stats) if (s.linkedTo != null) linkOffset(p, s, true);
+    }
+
+    private void clearLinkOffsets(Player p) {
+        for (Stat s : stats) if (s.linkedTo != null) p.getPersistentDataContainer().remove(keyFor("offset_" + s.id));
+    }
+
+    /** Linked stats (block reach) follow their source (entity reach) plus a rolled bonus. */
+    private void linkStats(Player p) {
+        for (Stat s : stats) {
+            if (s.linkedTo == null || s.attr == null) continue;
+            Stat src = findStat(s.linkedTo);
+            if (src == null || src.attr == null) continue;
+            AttributeInstance inst = p.getAttribute(s.attr), srcInst = p.getAttribute(src.attr);
+            if (inst == null || srcInst == null) continue;
+
+            NamespacedKey key = keyFor(s.id);
+            AttributeModifier old = findModifier(inst, key);
+            if (old != null) inst.removeModifier(old);
+
+            if (findModifier(srcInst, keyFor(src.id)) != null) { // source has been rolled
+                double srcValue = current(p, src);
+                double bonus = linkOffset(p, s, false);
+                if (srcValue > srcInst.getBaseValue() + 1e-9) { // reach above normal -> smaller bonus
+                    bonus *= getConfig().getDouble("block-reach-bonus.above-normal-multiplier", 0.5);
+                }
+                double target = srcValue + bonus;
+                inst.addModifier(new AttributeModifier(key, target - inst.getBaseValue(),
+                        AttributeModifier.Operation.ADD_NUMBER));
+            }
+        }
+    }
+
+    private static final String SCALE_BONUS_ID = "scale_speed_bonus";
+
+    /**
+     * Movement speed bonus for a bigger-than-normal player. Scale must be above 1.0.
+     * +10% if the speed roll is at or below normal, +5% if it is already above normal.
+     */
+    private double scaleBonusAmount(Player p) {
+        Stat sc = findStat("scale"), sp = findStat("movement_speed");
+        if (sc == null || sp == null || sc.attr == null || sp.attr == null) return 0.0;
+        if (current(p, sc) <= 1.0) return 0.0;
+        double below = getConfig().getDouble("scale-speed-bonus.speed-at-or-below-normal", 0.10);
+        double above = getConfig().getDouble("scale-speed-bonus.speed-above-normal", 0.05);
+        return current(p, sp) <= 1.0 ? below : above;
+    }
+
+    /** Applies the scale speed bonus on top of the movement speed roll. */
+    private void applyScaleBonus(Player p) {
+        Stat sp = findStat("movement_speed");
+        if (sp == null || sp.attr == null) return;
+        AttributeInstance inst = p.getAttribute(sp.attr);
+        if (inst == null) return;
+
+        NamespacedKey key = keyFor(SCALE_BONUS_ID);
+        AttributeModifier old = findModifier(inst, key);
+        if (old != null) inst.removeModifier(old);
+
+        double bonus = scaleBonusAmount(p);
+        if (bonus > 0) {
+            inst.addModifier(new AttributeModifier(key, bonus, AttributeModifier.Operation.ADD_SCALAR));
+        }
     }
 
     /** Peak height (blocks) of a jump with the given jump strength and gravity (vanilla tick physics). */
@@ -451,10 +564,20 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             if (Math.abs(delta) > 1e-6) {
                 boolean up = delta > 0;
                 if (s.good == Good.NEUTRAL) c = NamedTextColor.AQUA;
+                else if (s.good == Good.CENTER) {
+                    double off = normal == 0 ? 0 : Math.abs(delta / normal);
+                    c = off <= 0.05 ? NamedTextColor.GREEN : off <= 0.12 ? NamedTextColor.YELLOW : NamedTextColor.RED;
+                }
                 else if (s.good == Good.HIGH) c = up ? NamedTextColor.GREEN : NamedTextColor.RED;
                 else c = up ? NamedTextColor.RED : NamedTextColor.GREEN;
             }
             to.sendMessage(Component.text(text, c));
+        }
+
+        double scaleBonus = scaleBonusAmount(target);
+        if (scaleBonus > 0) {
+            to.sendMessage(Component.text(String.format("scale bonus: +%.0f%% movement speed (scale above 1.0)",
+                    scaleBonus * 100.0), NamedTextColor.YELLOW));
         }
 
         // jump info
