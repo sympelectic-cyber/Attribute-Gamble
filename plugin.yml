@@ -1,0 +1,20 @@
+name: AttributeGamble
+version: 3.0.0
+main: dev.gamble.AttributeGamblePlugin
+api-version: "1.21"
+description: Gambles player attributes on first join with balanced, fun twists.
+commands:
+  gamble:
+    description: View your gambled stats, power and reroll stats
+    usage: "/gamble [stats|power|roll <stat>|keep|revert] (ops: reroll <player> [all|stat], reset <player>, reload)"
+    aliases: [gstats, mystats]
+permissions:
+  gamble.stats:
+    description: View your own stats and power
+    default: true
+  gamble.roll:
+    description: Use /gamble roll, keep and revert
+    default: true
+  gamble.admin:
+    description: Reroll, reset, reload and view other players
+    default: op
