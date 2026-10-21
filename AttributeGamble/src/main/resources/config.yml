@@ -91,6 +91,21 @@ pillar-assist:
   enabled: true
   cooldown-ms: 250
 
+# --- Friction ----------------------------------------------------------
+# friction_modifier scales ground friction: higher = you top out slower (snappy,
+# grippy), lower = you slide. The plugin assumes the modifier scales the speed
+# lost each tick and corrects movement speed so a speed roll still feels like a buff.
+#   high-friction: 1.0 = fully cancel the top speed lost to high friction
+#   low-friction : 0.5 = remove half of the free speed from sliding
+# Raise/lower these if it feels too strong or too weak in play. (The formula is
+# a model - I could not test it in-game - so tune these by feel.)
+friction-compensation:
+  high-friction: 1.0
+  low-friction: 0.5
+
+# Open the stats menu automatically when a new player first joins.
+menu-on-first-join: true
+
 # --- Stat ranges -------------------------------------------------------
 # kind MULT: min/max are multipliers of normal (1.0 = normal)
 # entity_interaction_range: ABSOLUTE values (normal = 3.0)
