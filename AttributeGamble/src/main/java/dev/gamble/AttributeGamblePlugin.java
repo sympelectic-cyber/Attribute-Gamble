@@ -3,8 +3,10 @@ package dev.gamble;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
+import org.bukkit.Material;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Registry;
@@ -27,8 +29,14 @@ import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.inventory.ClickType;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -82,10 +90,67 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         final Map<String, String> str = new HashMap<>();
     }
 
+    static final class StatsMenu implements InventoryHolder {
+        final Player viewer, target;
+        final Map<Integer, Stat> slots = new HashMap<>();
+        Inventory inv;
+
+        StatsMenu(Player viewer, Player target) {
+            this.viewer = viewer;
+            this.target = target;
+        }
+
+        @Override
+        public Inventory getInventory() {
+            return inv;
+        }
+    }
+
+    private static final Map<String, String> ICONS = Map.ofEntries(
+            Map.entry("entity_interaction_range", "FISHING_ROD"),
+            Map.entry("block_interaction_range", "SCAFFOLDING"),
+            Map.entry("attack_speed", "CLOCK"),
+            Map.entry("attack_damage", "IRON_SWORD"),
+            Map.entry("max_health", "GOLDEN_APPLE"),
+            Map.entry("gravity", "FEATHER"),
+            Map.entry("jump_strength", "RABBIT_FOOT"),
+            Map.entry("movement_speed", "LEATHER_BOOTS"),
+            Map.entry("friction_modifier", "ICE"),
+            Map.entry("scale", "BROWN_MUSHROOM"),
+            Map.entry("safe_fall_distance", "SLIME_BLOCK"),
+            Map.entry("fall_damage_multiplier", "HAY_BLOCK"),
+            Map.entry("burning_time", "BLAZE_POWDER"),
+            Map.entry("sneaking_speed", "LEATHER_LEGGINGS"),
+            Map.entry("mining_efficiency", "IRON_PICKAXE"),
+            Map.entry("oxygen_bonus", "HEART_OF_THE_SEA"),
+            Map.entry("water_movement_efficiency", "PRISMARINE_SHARD"));
+
+    private static final Map<String, String> DESC = Map.ofEntries(
+            Map.entry("entity_interaction_range", "How far you can hit mobs and players."),
+            Map.entry("block_interaction_range", "How far you can mine and place blocks."),
+            Map.entry("attack_speed", "How fast your weapon recharges."),
+            Map.entry("attack_damage", "How hard you hit."),
+            Map.entry("max_health", "How many hearts you have."),
+            Map.entry("gravity", "How fast you fall. Lower is floatier."),
+            Map.entry("jump_strength", "How high you jump."),
+            Map.entry("movement_speed", "How fast you run."),
+            Map.entry("friction_modifier", "Ground grip. Near normal is best."),
+            Map.entry("scale", "How big your body is."),
+            Map.entry("safe_fall_distance", "How far you can fall unharmed."),
+            Map.entry("fall_damage_multiplier", "Fall damage taken. Lower is better."),
+            Map.entry("burning_time", "How long you burn. Lower is better."),
+            Map.entry("sneaking_speed", "How fast you move while sneaking."),
+            Map.entry("mining_efficiency", "Extra mining speed."),
+            Map.entry("oxygen_bonus", "Extra time underwater."),
+            Map.entry("water_movement_efficiency", "How well you move in water."));
+
+    private static final String[] RATING_WORDS = {"Poor", "Below average", "Average", "Good", "Excellent"};
+
     private static final List<String> GROUPS = List.of("combat", "mobility", "utility");
     private static final String STEP_ID = "step_height";
     private static final String SCALE_BONUS_ID = "scale_speed_bonus";
     private static final String LOW_HP_ID = "low_health_bonus";
+    private static final String FRICTION_COMP_ID = "friction_speed_comp";
 
     private final List<Stat> stats = new ArrayList<>();
     private final Map<UUID, Snapshot> pending = new HashMap<>();
@@ -199,8 +264,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             if (!p.isOnline()) return;
             if (first) {
                 rollAll(p);
-                p.sendMessage(Component.text("Welcome! You gambled your attributes:", NamedTextColor.GOLD));
-                sendStats(p, p);
+                p.sendMessage(Component.text("Welcome! You gambled your attributes - use /gamble to see them.", NamedTextColor.GOLD));
+                if (getConfig().getBoolean("menu-on-first-join", true)) openMenu(p, p);
             } else {
                 applyTitle(p);
             }
@@ -643,6 +708,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private void finish(Player p) {
         linkStats(p);
         applyScaleBonus(p);
+        applyFrictionCompensation(p);
         applyScaleTradeoffs(p);
         applyLowHealthBonus(p);
         fixJump(p);
@@ -719,6 +785,42 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         if (bonus > 0) {
             inst.addModifier(new AttributeModifier(keyFor(SCALE_BONUS_ID), bonus, AttributeModifier.Operation.ADD_SCALAR));
         }
+    }
+
+    /**
+     * Estimated top-speed ratio on the ground for a friction_modifier of m (1.0 = normal), assuming the
+     * modifier scales the per-tick speed loss (vanilla ground: 54.6% of speed is kept each tick).
+     * Above 1.0 you top out slower, below 1.0 you slide faster.
+     */
+    private double frictionRatio(double m) {
+        double d = 0.454 * m;
+        d = Math.max(0.05, Math.min(0.98, d));
+        return ((1.0 - d) / d) / (0.546 / 0.454);
+    }
+
+    private double frictionOf(Player p) {
+        Stat fr = findStat("friction_modifier");
+        if (fr == null || fr.attr == null) return 1.0;
+        return current(p, fr);
+    }
+
+    /** Cancels the top-speed lost to high friction, so a speed roll still feels like the buff it is. */
+    private void applyFrictionCompensation(Player p) {
+        Stat sp = findStat("movement_speed");
+        if (sp == null || sp.attr == null) return;
+        AttributeInstance inst = p.getAttribute(sp.attr);
+        if (inst == null) return;
+        removeMod(p, sp.attr, FRICTION_COMP_ID);
+
+        double m = frictionOf(p);
+        if (Math.abs(m - 1.0) < 1e-6) return;
+        double r = frictionRatio(m);
+        double strength = r < 1.0
+                ? getConfig().getDouble("friction-compensation.high-friction", 1.0)
+                : getConfig().getDouble("friction-compensation.low-friction", 0.5);
+        double c = Math.pow(r, -strength);
+        inst.addModifier(new AttributeModifier(keyFor(FRICTION_COMP_ID), c - 1.0,
+                AttributeModifier.Operation.MULTIPLY_SCALAR_1));
     }
 
     /** Big players resist knockback; small players are more fragile. */
@@ -993,7 +1095,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         rollOne(p, st);
 
         int secs = Math.max(3, getConfig().getInt("player-reroll.decision-seconds", 10));
-        sendStats(p, p);
+        Bukkit.getScheduler().runTask(this, () -> openMenu(p, p));
         p.sendMessage(Component.text("Keep the new roll? (" + secs + "s)  ", NamedTextColor.GOLD)
                 .append(Component.text("[KEEP]", NamedTextColor.GREEN).clickEvent(ClickEvent.runCommand("/gamble keep")))
                 .append(Component.text("  "))
@@ -1095,6 +1197,293 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         to.sendMessage(Component.text(String.format("total power: x%.2f", power(target, null)), NamedTextColor.GREEN));
     }
 
+    // ------------------------------------------------------------------ stats menu
+
+    private Component line(String text, NamedTextColor c) {
+        return Component.text(text, c).decoration(TextDecoration.ITALIC, false);
+    }
+
+    private ItemStack icon(Material m, Component name, List<Component> lore) {
+        ItemStack it = new ItemStack(m);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(name);
+        if (lore != null) meta.lore(lore);
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    private String pretty(String id) {
+        StringBuilder sb = new StringBuilder();
+        for (String w : id.split("_")) {
+            if (w.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+        }
+        return sb.toString();
+    }
+
+    private NamedTextColor ratingColor(int level) {
+        return switch (level) {
+            case 0 -> NamedTextColor.RED;
+            case 1 -> NamedTextColor.GOLD;
+            case 2 -> NamedTextColor.YELLOW;
+            case 3 -> NamedTextColor.GREEN;
+            default -> NamedTextColor.AQUA;
+        };
+    }
+
+    /** 0 (poor) .. 4 (excellent), -1 if not rolled yet. */
+    private int ratingLevel(Player p, Stat s) {
+        Stat src = s.linkedTo != null ? findStat(s.linkedTo) : s;
+        if (src == null || src.attr == null) return -1;
+        AttributeInstance inst = p.getAttribute(src.attr);
+        if (inst == null || findModifier(inst, keyFor(src.id)) == null) return -1;
+        double pos = pos(src, current(p, src));
+        return Math.max(0, Math.min(4, (int) Math.round((pos + 1.0) / 2.0 * 4.0)));
+    }
+
+    private int remainingRerolls(Player p) {
+        int limit = getConfig().getInt("player-reroll.daily-limit", 3);
+        if (limit <= 0) return -1;
+        PersistentDataContainer pdc = p.getPersistentDataContainer();
+        long today = System.currentTimeMillis() / 86_400_000L;
+        Long day = pdc.get(keyFor("reroll_day"), PersistentDataType.LONG);
+        Integer cnt = pdc.get(keyFor("reroll_count"), PersistentDataType.INTEGER);
+        int used = (day != null && day == today && cnt != null) ? cnt : 0;
+        return Math.max(0, limit - used);
+    }
+
+    private ItemStack statItem(Stat s, Player target, boolean admin, boolean canRoll) {
+        Material mat = Material.matchMaterial(ICONS.getOrDefault(s.id, "PAPER"));
+        if (mat == null) mat = Material.PAPER;
+
+        List<Component> lore = new ArrayList<>();
+        lore.add(line(DESC.getOrDefault(s.id, ""), NamedTextColor.GRAY));
+
+        if (s.good == Good.NEUTRAL) {
+            double v = current(target, s);
+            String size = v < 0.9 ? "Small" : v > 1.1 ? "Large" : "Medium";
+            lore.add(line("Size: " + size, NamedTextColor.AQUA));
+        } else {
+            int level = ratingLevel(target, s);
+            if (level < 0) {
+                lore.add(line("Not rolled yet", NamedTextColor.DARK_GRAY));
+            } else {
+                NamedTextColor c = ratingColor(level);
+                lore.add(Component.text("Roll: ", NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false)
+                        .append(Component.text("\u25A0".repeat(level + 1), c))
+                        .append(Component.text("\u25A1".repeat(4 - level), NamedTextColor.DARK_GRAY))
+                        .append(Component.text(" " + RATING_WORDS[level], c)));
+            }
+        }
+
+        if (admin) {
+            AttributeInstance inst = target.getAttribute(s.attr);
+            if (inst != null) {
+                double normal = inst.getBaseValue(), now = inst.getValue();
+                lore.add(line("", NamedTextColor.GRAY));
+                if (normal != 0) {
+                    lore.add(line(String.format("Normal %.3f -> now %.3f (%+.0f%%)", normal, now, (now / normal - 1.0) * 100.0),
+                            NamedTextColor.WHITE));
+                } else {
+                    lore.add(line(String.format("Now %.2f (%+.2f)", now, now - normal), NamedTextColor.WHITE));
+                }
+                if (s.linkedTo != null) {
+                    lore.add(line("Follows " + pretty(s.linkedTo) + " + bonus", NamedTextColor.DARK_AQUA));
+                } else {
+                    lore.add(line(String.format("Range %.2f to %.2f", s.lo, s.hi), NamedTextColor.DARK_AQUA));
+                    lore.add(line(String.format("Weight %.1f, group %s, good: %s", s.weight,
+                            s.group == null ? "none" : s.group, s.good.name().toLowerCase(Locale.ROOT)), NamedTextColor.DARK_AQUA));
+                }
+            }
+        }
+        if (canRoll && s.attr != null) {
+            lore.add(line("", NamedTextColor.GRAY));
+            lore.add(line("Shift-click to reroll", NamedTextColor.DARK_GRAY));
+        }
+        return icon(mat, line(pretty(s.id), NamedTextColor.WHITE), lore);
+    }
+
+    private List<Component> adminLines(Player t) {
+        List<Component> out = new ArrayList<>();
+        out.add(line("Operator details", NamedTextColor.GOLD));
+        for (String group : GROUPS) {
+            if (members(group).isEmpty()) continue;
+            out.add(line(String.format("%s: balance %+.1f%% (limit +/-%.0f%%), power x%.2f", pretty(group),
+                    netOf(t, group) * 100.0, tolerance(group) * 100.0, power(t, group)), NamedTextColor.AQUA));
+        }
+        out.add(line(String.format("Total power: x%.2f", power(t, null)), NamedTextColor.GREEN));
+
+        double sb = scaleBonusAmount(t);
+        if (sb > 0) out.add(line(String.format("Scale bonus: +%.0f%% movement speed", sb * 100.0), NamedTextColor.YELLOW));
+
+        if (lowHealth(t)) {
+            PersistentDataContainer pdc = t.getPersistentDataContainer();
+            String id = pdc.get(keyFor("low_hp_stat"), PersistentDataType.STRING);
+            Double val = pdc.get(keyFor("low_hp_value"), PersistentDataType.DOUBLE);
+            if (id != null && val != null) {
+                out.add(line(String.format("Low health bonus: +%.0f%% %s", val * 100.0, pretty(id)), NamedTextColor.YELLOW));
+            }
+        }
+
+        Stat sp = findStat("movement_speed");
+        if (sp != null && sp.attr != null) {
+            AttributeInstance si = t.getAttribute(sp.attr);
+            if (si != null && si.getBaseValue() != 0) {
+                AttributeModifier fm = findModifier(si, keyFor(FRICTION_COMP_ID));
+                if (fm != null) {
+                    out.add(line(String.format("Friction speed comp: x%.2f", 1.0 + fm.getAmount()), NamedTextColor.YELLOW));
+                }
+                double est = 4.317 * (si.getValue() / si.getBaseValue()) * frictionRatio(frictionOf(t));
+                out.add(line(String.format("Est. walk speed: %.1f b/s (model)", est), NamedTextColor.YELLOW));
+            }
+        }
+
+        Stat g = findStat("gravity"), j = findStat("jump_strength");
+        if (g != null && j != null && g.attr != null && j.attr != null) {
+            AttributeInstance gi = t.getAttribute(g.attr), ji = t.getAttribute(j.attr);
+            if (gi != null && ji != null) {
+                String extra = "";
+                Attribute stepAttr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft(STEP_ID));
+                AttributeInstance st = stepAttr == null ? null : t.getAttribute(stepAttr);
+                if (st != null) extra = String.format(", step %.2f", st.getValue());
+                out.add(line(String.format("Jump ~%.2f blocks%s%s", jumpPeak(gi.getValue(), ji.getValue()), extra,
+                        needsPillarAssist(t) ? ", pillar assist on" : ""), NamedTextColor.YELLOW));
+            }
+        }
+        return out;
+    }
+
+    private void placeGroup(StatsMenu menu, Player target, boolean admin, boolean canRoll,
+                            int labelSlot, String label, NamedTextColor color, int[] slots, String... ids) {
+        menu.inv.setItem(labelSlot, icon(Material.PAPER, line(label, color), null));
+        for (int i = 0; i < ids.length && i < slots.length; i++) {
+            Stat s = findStat(ids[i]);
+            if (s == null || s.attr == null) continue;
+            menu.slots.put(slots[i], s);
+            menu.inv.setItem(slots[i], statItem(s, target, admin, canRoll));
+        }
+    }
+
+    private void openMenu(Player viewer, Player target) {
+        boolean admin = viewer.hasPermission("gamble.admin");
+        boolean own = viewer.getUniqueId().equals(target.getUniqueId());
+        boolean canRoll = own && getConfig().getBoolean("player-reroll.enabled", true) && viewer.hasPermission("gamble.roll");
+
+        StatsMenu menu = new StatsMenu(viewer, target);
+        Inventory inv = Bukkit.createInventory(menu, 54, Component.text(target.getName() + "'s Stats"));
+        menu.inv = inv;
+
+        ItemStack filler = icon(Material.GRAY_STAINED_GLASS_PANE, Component.text(" "), null);
+        for (int i = 0; i < 54; i++) inv.setItem(i, filler);
+
+        // header
+        List<Component> head = new ArrayList<>();
+        if (hasRolls(target)) {
+            head.add(line("Title: " + computeTitle(target), NamedTextColor.LIGHT_PURPLE));
+            String jp = target.getPersistentDataContainer().get(keyFor("jackpot_stat"), PersistentDataType.STRING);
+            if (jp != null) head.add(line("JACKPOT: " + pretty(jp), NamedTextColor.LIGHT_PURPLE));
+        } else {
+            head.add(line("Not gambled yet", NamedTextColor.GRAY));
+        }
+        inv.setItem(4, icon(Material.NETHER_STAR, line(target.getName(), NamedTextColor.GOLD), head));
+
+        placeGroup(menu, target, admin, canRoll, 9, "Combat", NamedTextColor.RED, new int[]{10, 11, 12, 13, 14},
+                "entity_interaction_range", "block_interaction_range", "attack_speed", "attack_damage", "max_health");
+        placeGroup(menu, target, admin, canRoll, 18, "Mobility", NamedTextColor.GREEN, new int[]{19, 20, 21, 22, 23},
+                "gravity", "jump_strength", "movement_speed", "friction_modifier", "scale");
+        placeGroup(menu, target, admin, canRoll, 27, "Utility", NamedTextColor.YELLOW, new int[]{28, 29, 30, 31},
+                "safe_fall_distance", "fall_damage_multiplier", "burning_time", "sneaking_speed");
+        placeGroup(menu, target, admin, canRoll, 32, "Other", NamedTextColor.AQUA, new int[]{33, 34, 35},
+                "mining_efficiency", "oxygen_bonus", "water_movement_efficiency");
+
+        // info
+        List<Component> info = new ArrayList<>();
+        info.add(line("Fuller bars = better rolls.", NamedTextColor.GRAY));
+        info.add(line("Stats are balanced: a great roll", NamedTextColor.GRAY));
+        info.add(line("somewhere usually costs you elsewhere.", NamedTextColor.GRAY));
+        if (needsPillarAssist(target) && getConfig().getBoolean("pillar-assist.enabled", true)) {
+            info.add(line("", NamedTextColor.GRAY));
+            info.add(line("Low jump: sneak + look down +", NamedTextColor.YELLOW));
+            info.add(line("right-click a block to build up.", NamedTextColor.YELLOW));
+        }
+        if (canRoll) {
+            int left = remainingRerolls(target);
+            info.add(line("", NamedTextColor.GRAY));
+            info.add(line("Shift-click a stat to reroll it", NamedTextColor.GOLD));
+            info.add(line("Cost: " + getConfig().getInt("player-reroll.xp-levels", 5) + " XP levels", NamedTextColor.GOLD));
+            info.add(line(left < 0 ? "Rerolls today: unlimited" : "Rerolls left today: " + left, NamedTextColor.GOLD));
+        }
+        inv.setItem(45, icon(Material.BOOK, line("How it works", NamedTextColor.WHITE), info));
+
+        if (admin) {
+            inv.setItem(49, icon(Material.COMMAND_BLOCK, line("Operator info", NamedTextColor.GOLD), adminLines(target)));
+        }
+
+        if (own && pending.containsKey(target.getUniqueId())) {
+            inv.setItem(48, icon(Material.LIME_CONCRETE, line("KEEP the new roll", NamedTextColor.GREEN), null));
+            inv.setItem(50, icon(Material.RED_CONCRETE, line("REVERT to the old roll", NamedTextColor.RED), null));
+        }
+        inv.setItem(53, icon(Material.BARRIER, line("Close", NamedTextColor.RED), null));
+
+        viewer.openInventory(inv);
+    }
+
+    private void keepRoll(Player p) {
+        if (pending.remove(p.getUniqueId()) == null) {
+            p.sendMessage(Component.text("Nothing to keep.", NamedTextColor.RED));
+            return;
+        }
+        p.sendMessage(Component.text("Kept your new roll.", NamedTextColor.GREEN));
+    }
+
+    private void revertRoll(Player p) {
+        Snapshot snap = pending.remove(p.getUniqueId());
+        if (snap == null) {
+            p.sendMessage(Component.text("Nothing to revert.", NamedTextColor.RED));
+            return;
+        }
+        restore(p, snap);
+        p.sendMessage(Component.text("Reverted to your previous stats (the reroll still counts).", NamedTextColor.YELLOW));
+    }
+
+    @EventHandler
+    public void onMenuClick(InventoryClickEvent e) {
+        if (!(e.getView().getTopInventory().getHolder() instanceof StatsMenu menu)) return;
+        e.setCancelled(true);
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        if (e.getClickedInventory() == null || e.getClickedInventory() != e.getView().getTopInventory()) return;
+
+        int slot = e.getRawSlot();
+        if (slot == 53) {
+            p.closeInventory();
+            return;
+        }
+        if (!menu.viewer.getUniqueId().equals(menu.target.getUniqueId())) return; // read-only view
+
+        if (slot == 48 && pending.containsKey(p.getUniqueId())) {
+            keepRoll(p);
+            Bukkit.getScheduler().runTask(this, () -> openMenu(p, p));
+            return;
+        }
+        if (slot == 50 && pending.containsKey(p.getUniqueId())) {
+            revertRoll(p);
+            Bukkit.getScheduler().runTask(this, () -> openMenu(p, p));
+            return;
+        }
+
+        Stat s = menu.slots.get(slot);
+        if (s != null && e.getClick() == ClickType.SHIFT_LEFT && p.hasPermission("gamble.roll")) {
+            p.closeInventory();
+            Bukkit.getScheduler().runTask(this, () -> handleRoll(p, s.id));
+        }
+    }
+
+    @EventHandler
+    public void onMenuDrag(InventoryDragEvent e) {
+        if (e.getView().getTopInventory().getHolder() instanceof StatsMenu) e.setCancelled(true);
+    }
+
     // ------------------------------------------------------------------ command
 
     private boolean deny(CommandSender s, String msg) {
@@ -1106,8 +1495,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         String sub = args.length == 0 ? "stats" : args[0].toLowerCase(Locale.ROOT);
 
-        // everyone: stats / power
-        if (sub.equals("stats") || sub.equals("power")) {
+        // stats menu
+        if (sub.equals("stats")) {
             Player target;
             if (args.length >= 2) {
                 if (!sender.hasPermission("gamble.admin")) return deny(sender, "Only operators can view other players.");
@@ -1117,11 +1506,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 if (!sender.hasPermission("gamble.stats")) return deny(sender, "You can't view stats.");
                 target = self;
             } else {
-                sender.sendMessage("Usage: /gamble " + sub + " <player>");
+                sender.sendMessage("Usage: /gamble stats <player>");
                 return true;
             }
-            if (sub.equals("stats")) sendStats(sender, target);
-            else sendPower(sender, target);
+            if (sender instanceof Player viewer) openMenu(viewer, target);
+            else sendStats(sender, target);
             return true;
         }
 
@@ -1150,7 +1539,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
         // operators
         if (!sender.hasPermission("gamble.admin")) {
-            return deny(sender, "Unknown command. Try /gamble, /gamble power or /gamble roll <stat>.");
+            return deny(sender, "Unknown command. Try /gamble or /gamble roll <stat>.");
         }
 
         if (sub.equals("reload")) {
@@ -1161,7 +1550,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
 
         if (args.length < 2) {
-            sender.sendMessage(Component.text("Usage: /gamble reroll <player> [all|stat]  |  /gamble reset <player>  |  /gamble stats|power [player]  |  /gamble reload",
+            sender.sendMessage(Component.text("Usage: /gamble reroll <player> [all|stat]  |  /gamble reset <player>  |  /gamble stats [player]  |  /gamble reload",
                     NamedTextColor.YELLOW));
             return true;
         }
@@ -1180,9 +1569,9 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 }
                 sender.sendMessage(Component.text("Rerolled " + what + " for " + target.getName() + ".", NamedTextColor.GREEN));
                 if (target != sender) {
-                    target.sendMessage(Component.text("An operator rerolled your attributes!", NamedTextColor.GOLD));
+                    target.sendMessage(Component.text("An operator rerolled your attributes! Use /gamble to see them.", NamedTextColor.GOLD));
                 }
-                sendStats(target, target);
+                if (sender instanceof Player viewer) openMenu(viewer, target);
             }
             case "reset" -> {
                 resetPlayer(target);
@@ -1203,7 +1592,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         List<String> opts = new ArrayList<>();
 
         if (args.length == 1) {
-            opts.addAll(List.of("stats", "power", "roll", "keep", "revert"));
+            opts.addAll(List.of("stats", "roll", "keep", "revert"));
             if (admin) opts.addAll(List.of("reroll", "reset", "reload"));
         } else if (args.length == 2) {
             String sub = args[0].toLowerCase(Locale.ROOT);
