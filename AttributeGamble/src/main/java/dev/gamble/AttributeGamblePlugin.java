@@ -1,15 +1,18 @@
 package dev.gamble;
 
+import io.papermc.paper.chat.ChatRenderer;
+import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
-import org.bukkit.Material;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Registry;
+import org.bukkit.Sound;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.attribute.AttributeModifier;
@@ -20,18 +23,23 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabExecutor;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.inventory.ClickType;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
-import org.bukkit.event.inventory.ClickType;
-import org.bukkit.event.inventory.InventoryClickEvent;
-import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
@@ -43,6 +51,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Listener {
@@ -50,38 +59,45 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     /** MULT: factor of normal. ABS: absolute final value. ADD: flat amount added to normal. */
     enum Kind { MULT, ABS, ADD }
 
-    /** HIGH/LOW: better at that end. CENTER: best at normal. NEUTRAL: ignored by balance + pity. */
-    enum Good { HIGH, LOW, CENTER, NEUTRAL }
+    /** HIGH/LOW: better at that end. NEUTRAL: ignored by balance and pity. */
+    enum Good { HIGH, LOW, NEUTRAL }
+
+    static final int LEVELS = 5;
 
     static final class Stat {
         final String id;
         final String group;          // null = independent
         final Kind kind;
-        final double defLo, defHi;
         final Good defGood;
+        final double[] defLevels;
         double defWeight = 1.0;
+        double defUnit = 1.0;
 
         Attribute attr;              // null if this server doesn't have the attribute
-        double lo, hi, weight = 1.0;
+        double[] levels;             // 5 possible rolls, ascending
+        double weight = 1.0;
+        double unit = 1.0;           // for ADD stats with base 0: how much counts as +100% in balance maths
         Good good;
         String linkedTo;             // if set, follows another stat instead of rolling
 
-        Stat(String id, String group, Kind kind, double lo, double hi, Good good) {
+        Stat(String id, String group, Kind kind, Good good, double[] levels) {
             this.id = id;
             this.group = group;
             this.kind = kind;
-            this.defLo = lo;
-            this.defHi = hi;
             this.defGood = good;
+            this.defLevels = levels;
         }
 
         boolean counted() {
-            return group != null && (good == Good.HIGH || good == Good.LOW) && attr != null;
+            return group != null && good != Good.NEUTRAL && attr != null;
         }
 
         double sign() {
             return good == Good.LOW ? -1.0 : 1.0;
         }
+
+        double lo() { return levels[0]; }
+        double hi() { return levels[LEVELS - 1]; }
     }
 
     static final class Snapshot {
@@ -106,43 +122,69 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
     }
 
+    static final class RollMenu implements InventoryHolder {
+        Inventory inv;
+        volatile boolean closed;
+
+        @Override
+        public Inventory getInventory() {
+            return inv;
+        }
+    }
+
+    private record GroupLayout(String label, NamedTextColor color, int labelSlot, int[] slots, String[] ids) {}
+
+    private static final List<GroupLayout> LAYOUT = List.of(
+            new GroupLayout("Combat", NamedTextColor.RED, 9, new int[]{10, 11, 12, 13, 14},
+                    new String[]{"entity_interaction_range", "block_interaction_range", "attack_speed", "attack_knockback", "max_health"}),
+            new GroupLayout("Mobility", NamedTextColor.GREEN, 18, new int[]{19, 20, 21, 22},
+                    new String[]{"gravity", "jump_strength", "movement_speed", "scale"}),
+            new GroupLayout("Utility", NamedTextColor.YELLOW, 27, new int[]{28, 29, 30, 31},
+                    new String[]{"safe_fall_distance", "fall_damage_multiplier", "burning_time", "sneaking_speed"}),
+            new GroupLayout("Other", NamedTextColor.AQUA, 32, new int[]{33, 34, 35},
+                    new String[]{"block_break_speed", "oxygen_bonus", "submerged_mining_speed"}));
+
+    private static final Material[] PANES = {
+            Material.RED_STAINED_GLASS_PANE, Material.ORANGE_STAINED_GLASS_PANE, Material.YELLOW_STAINED_GLASS_PANE,
+            Material.LIME_STAINED_GLASS_PANE, Material.LIGHT_BLUE_STAINED_GLASS_PANE};
+
+    private static final long ANIMATION_TICKS = 140L;
+
     private static final Map<String, String> ICONS = Map.ofEntries(
             Map.entry("entity_interaction_range", "FISHING_ROD"),
             Map.entry("block_interaction_range", "SCAFFOLDING"),
             Map.entry("attack_speed", "CLOCK"),
-            Map.entry("attack_damage", "IRON_SWORD"),
+            Map.entry("attack_knockback", "PISTON"),
             Map.entry("max_health", "GOLDEN_APPLE"),
             Map.entry("gravity", "FEATHER"),
             Map.entry("jump_strength", "RABBIT_FOOT"),
             Map.entry("movement_speed", "LEATHER_BOOTS"),
-            Map.entry("friction_modifier", "ICE"),
             Map.entry("scale", "BROWN_MUSHROOM"),
             Map.entry("safe_fall_distance", "SLIME_BLOCK"),
             Map.entry("fall_damage_multiplier", "HAY_BLOCK"),
             Map.entry("burning_time", "BLAZE_POWDER"),
             Map.entry("sneaking_speed", "LEATHER_LEGGINGS"),
-            Map.entry("mining_efficiency", "IRON_PICKAXE"),
+            Map.entry("block_break_speed", "IRON_PICKAXE"),
             Map.entry("oxygen_bonus", "HEART_OF_THE_SEA"),
-            Map.entry("water_movement_efficiency", "PRISMARINE_SHARD"));
+            Map.entry("submerged_mining_speed", "PRISMARINE_SHARD"));
 
     private static final Map<String, String> DESC = Map.ofEntries(
             Map.entry("entity_interaction_range", "How far you can hit mobs and players."),
             Map.entry("block_interaction_range", "How far you can mine and place blocks."),
             Map.entry("attack_speed", "How fast your weapon recharges."),
-            Map.entry("attack_damage", "How hard you hit."),
+            Map.entry("attack_knockback", "How hard you knock enemies back."),
             Map.entry("max_health", "How many hearts you have."),
-            Map.entry("gravity", "How fast you fall. Lower is floatier."),
+            Map.entry("gravity", "How fast you fall."),
             Map.entry("jump_strength", "How high you jump."),
             Map.entry("movement_speed", "How fast you run."),
-            Map.entry("friction_modifier", "Ground grip. Near normal is best."),
             Map.entry("scale", "How big your body is."),
             Map.entry("safe_fall_distance", "How far you can fall unharmed."),
-            Map.entry("fall_damage_multiplier", "Fall damage taken. Lower is better."),
-            Map.entry("burning_time", "How long you burn. Lower is better."),
+            Map.entry("fall_damage_multiplier", "How much damage falls do to you."),
+            Map.entry("burning_time", "How long you burn."),
             Map.entry("sneaking_speed", "How fast you move while sneaking."),
-            Map.entry("mining_efficiency", "Extra mining speed."),
+            Map.entry("block_break_speed", "How fast you break blocks."),
             Map.entry("oxygen_bonus", "Extra time underwater."),
-            Map.entry("water_movement_efficiency", "How well you move in water."));
+            Map.entry("submerged_mining_speed", "How fast you mine underwater."));
 
     private static final String[] RATING_WORDS = {"Poor", "Below average", "Average", "Good", "Excellent"};
 
@@ -150,11 +192,13 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private static final String STEP_ID = "step_height";
     private static final String SCALE_BONUS_ID = "scale_speed_bonus";
     private static final String LOW_HP_ID = "low_health_bonus";
-    private static final String FRICTION_COMP_ID = "friction_speed_comp";
 
     private final List<Stat> stats = new ArrayList<>();
     private final Map<UUID, Snapshot> pending = new HashMap<>();
     private final Map<UUID, Long> pillarCooldown = new HashMap<>();
+    private final Map<UUID, Component> titleCache = new ConcurrentHashMap<>();
+    /** Custom penalties for rolls the game can't represent: [knockback penalty, oxygen penalty] (positive numbers). */
+    private final Map<UUID, double[]> negatives = new ConcurrentHashMap<>();
 
     // ------------------------------------------------------------------ setup
 
@@ -169,10 +213,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             cmd.setTabCompleter(this);
         }
         Bukkit.getScheduler().runTaskTimer(this, this::periodicTick, 1200L, 1200L);
+        Bukkit.getScheduler().runTaskTimer(this, this::negativeTick, 40L, 2L);
     }
 
-    private Stat def(String id, String group, Kind kind, double lo, double hi, Good good) {
-        Stat s = new Stat(id, group, kind, lo, hi, good);
+    private Stat def(String id, String group, Kind kind, Good good, double... levels) {
+        Stat s = new Stat(id, group, kind, good, levels);
         stats.add(s);
         return s;
     }
@@ -181,41 +226,46 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         stats.clear();
 
         // combat
-        def("entity_interaction_range", "combat", Kind.ABS, 3.0, 5.0, Good.HIGH).defWeight = 2.0;
-        def("attack_speed", "combat", Kind.MULT, 0.6, 1.5, Good.HIGH);
-        def("attack_damage", "combat", Kind.MULT, 0.6, 1.5, Good.HIGH);
-        def("max_health", "combat", Kind.MULT, 0.6, 1.5, Good.HIGH);
+        def("entity_interaction_range", "combat", Kind.ABS, Good.HIGH, 2.0, 2.5, 3.0, 3.5, 4.0).defWeight = 2.0;
+        def("attack_speed", "combat", Kind.MULT, Good.HIGH, 0.6, 0.8, 1.0, 1.2, 1.4);
+        Stat kb = def("attack_knockback", "combat", Kind.ADD, Good.HIGH, -1.0, -0.5, 0.0, 0.5, 1.0);
+        kb.defUnit = 4.0;
+        def("max_health", "combat", Kind.MULT, Good.HIGH, 0.6, 0.8, 1.0, 1.2, 1.4);
 
         // mobility
-        def("gravity", "mobility", Kind.MULT, 0.4, 1.6, Good.LOW);
-        def("jump_strength", "mobility", Kind.MULT, 0.3, 1.8, Good.HIGH);
-        def("movement_speed", "mobility", Kind.MULT, 0.6, 1.5, Good.HIGH);
-        def("friction_modifier", "mobility", Kind.MULT, 0.8, 1.2, Good.CENTER);
-        def("scale", "mobility", Kind.MULT, 0.75, 1.25, Good.NEUTRAL);
+        def("gravity", "mobility", Kind.MULT, Good.LOW, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("jump_strength", "mobility", Kind.MULT, Good.HIGH, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("movement_speed", "mobility", Kind.MULT, Good.HIGH, 0.6, 0.8, 1.0, 1.2, 1.4);
+        def("scale", "mobility", Kind.MULT, Good.NEUTRAL, 0.6, 0.8, 1.0, 1.2, 1.4);
 
         // utility quirks
-        def("safe_fall_distance", "utility", Kind.MULT, 0.5, 2.0, Good.HIGH);
-        def("fall_damage_multiplier", "utility", Kind.MULT, 0.5, 1.5, Good.LOW);
-        def("burning_time", "utility", Kind.MULT, 0.5, 1.5, Good.LOW);
-        def("sneaking_speed", "utility", Kind.MULT, 0.6, 1.5, Good.HIGH);
+        def("safe_fall_distance", "utility", Kind.MULT, Good.HIGH, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("fall_damage_multiplier", "utility", Kind.MULT, Good.LOW, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("burning_time", "utility", Kind.MULT, Good.LOW, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("sneaking_speed", "utility", Kind.MULT, Good.HIGH, 0.6, 0.8, 1.0, 1.2, 1.4);
 
         // independent
-        def("mining_efficiency", null, Kind.ADD, 0.0, 1.5, Good.HIGH);
-        def("oxygen_bonus", null, Kind.ADD, 0.0, 5.0, Good.HIGH);
-        def("water_movement_efficiency", null, Kind.ADD, 0.0, 1.0, Good.HIGH);
+        def("block_break_speed", null, Kind.MULT, Good.HIGH, 0.5, 0.75, 1.0, 1.25, 1.5);
+        def("oxygen_bonus", null, Kind.ADD, Good.HIGH, -2.0, -1.0, 0.0, 1.0, 2.0);
+        def("submerged_mining_speed", null, Kind.MULT, Good.HIGH, 0.5, 0.75, 1.0, 1.25, 1.5);
 
         // linked: block reach follows entity reach (+ bonus)
-        Stat block = def("block_interaction_range", null, Kind.ADD, 0.0, 0.0, Good.HIGH);
+        Stat block = def("block_interaction_range", null, Kind.ADD, Good.HIGH, 0.0, 0.0, 0.0, 0.0, 0.0);
         block.linkedTo = "entity_interaction_range";
 
         for (Stat s : stats) {
             s.attr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft(s.id));
             String path = "stats." + s.id + ".";
-            double a = getConfig().getDouble(path + "min", s.defLo);
-            double b = getConfig().getDouble(path + "max", s.defHi);
-            s.lo = Math.min(a, b);
-            s.hi = Math.max(a, b);
+
+            double[] lv = s.defLevels.clone();
+            List<Double> cfg = getConfig().getDoubleList(path + "levels");
+            if (s.linkedTo == null && cfg.size() == LEVELS) {
+                for (int i = 0; i < LEVELS; i++) lv[i] = cfg.get(i);
+                Arrays.sort(lv);
+            }
+            s.levels = lv;
             s.weight = Math.max(0.01, getConfig().getDouble(path + "weight", s.defWeight));
+            s.unit = Math.max(0.01, getConfig().getDouble(path + "unit", s.defUnit));
             try {
                 s.good = Good.valueOf(getConfig().getString(path + "good", s.defGood.name()).toUpperCase(Locale.ROOT));
             } catch (IllegalArgumentException ex) {
@@ -265,17 +315,23 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             if (first) {
                 rollAll(p);
                 p.sendMessage(Component.text("Welcome! You gambled your attributes - use /gamble to see them.", NamedTextColor.GOLD));
-                if (getConfig().getBoolean("menu-on-first-join", true)) openMenu(p, p);
+                boolean showMenu = getConfig().getBoolean("menu-on-first-join", true);
+                if (animationEnabled()) playFullRoll(p, () -> { if (showMenu) openMenu(p, p); });
+                else if (showMenu) openMenu(p, p);
             } else {
                 applyTitle(p);
+                updateNegatives(p);
             }
         });
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
-        pending.remove(e.getPlayer().getUniqueId()); // unanswered reroll = keep
-        pillarCooldown.remove(e.getPlayer().getUniqueId());
+        UUID id = e.getPlayer().getUniqueId();
+        pending.remove(id); // unanswered reroll = keep
+        pillarCooldown.remove(id);
+        titleCache.remove(id);
+        negatives.remove(id);
     }
 
     @EventHandler
@@ -292,9 +348,33 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 if (r.isEmpty()) return;
                 Stat st = r.get(ThreadLocalRandom.current().nextInt(r.size()));
                 rollOne(p, st);
-                p.sendMessage(Component.text("You died - " + st.id + " was rerolled!", NamedTextColor.GOLD));
+                p.sendMessage(Component.text("You died - " + pretty(st.id) + " was rerolled!", NamedTextColor.GOLD));
             }
         });
+    }
+
+    /** No auto-step while sneaking. */
+    @EventHandler
+    public void onSneak(PlayerToggleSneakEvent e) {
+        Player p = e.getPlayer();
+        Attribute stepAttr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft(STEP_ID));
+        if (stepAttr == null) return;
+        if (e.isSneaking()) {
+            removeMod(p, stepAttr, STEP_ID);
+        } else {
+            Bukkit.getScheduler().runTask(this, () -> fixJump(p));
+        }
+    }
+
+    /** Title as a chat prefix. */
+    @EventHandler
+    public void onChat(AsyncChatEvent e) {
+        if (!getConfig().getBoolean("titles.chat-prefix", true)) return;
+        Component tag = titleCache.get(e.getPlayer().getUniqueId());
+        if (tag == null) return;
+        e.renderer(ChatRenderer.viewerUnaware((source, name, message) ->
+                Component.text().append(tag).append(Component.text(" <")).append(name)
+                        .append(Component.text("> ")).append(message).build()));
     }
 
     private void periodicTick() {
@@ -315,9 +395,57 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
     }
 
+    // ------------------------------------------------------------------ negative rolls (custom effects)
+
+    /**
+     * Minecraft attributes can't go below 0 for attack knockback and oxygen bonus, so negative rolls are
+     * emulated: weaker knockback on your hits, faster air loss underwater.
+     */
+    private void updateNegatives(Player p) {
+        double kb = 0, ox = 0;
+        Stat k = findStat("attack_knockback"), o = findStat("oxygen_bonus");
+        if (k != null && k.attr != null && isRolled(p, k)) kb = Math.min(0.0, current(p, k));
+        if (o != null && o.attr != null && isRolled(p, o)) ox = Math.min(0.0, current(p, o));
+        if (kb < 0 || ox < 0) negatives.put(p.getUniqueId(), new double[]{-kb, -ox});
+        else negatives.remove(p.getUniqueId());
+    }
+
+    private void negativeTick() {
+        if (negatives.isEmpty()) return;
+        double perPoint = getConfig().getDouble("negative-stats.oxygen-drain-per-point", 1.0);
+        for (var e : negatives.entrySet()) {
+            double ox = e.getValue()[1];
+            if (ox <= 0) continue;
+            Player p = Bukkit.getPlayer(e.getKey());
+            if (p == null || !p.isOnline()) continue;
+            if (p.getGameMode() != GameMode.SURVIVAL && p.getGameMode() != GameMode.ADVENTURE) continue;
+            if (p.getEyeLocation().getBlock().getType() != Material.WATER) continue;
+            int air = p.getRemainingAir();
+            if (air >= p.getMaximumAir()) continue;
+            int extra = (int) Math.round(ox * perPoint);
+            if (extra > 0) p.setRemainingAir(Math.max(-19, air - extra));
+        }
+    }
+
+    /** Negative attack knockback: your melee hits push enemies back less. */
+    @EventHandler(ignoreCancelled = true)
+    public void onKnockbackPenalty(EntityDamageByEntityEvent e) {
+        if (e.getCause() != EntityDamageEvent.DamageCause.ENTITY_ATTACK) return;
+        if (!(e.getDamager() instanceof Player attacker)) return;
+        double[] n = negatives.get(attacker.getUniqueId());
+        if (n == null || n[0] <= 0) return;
+        if (!(e.getEntity() instanceof LivingEntity victim)) return;
+
+        double cut = Math.min(0.9, n[0] * getConfig().getDouble("negative-stats.knockback-cut-per-point", 0.5));
+        Bukkit.getScheduler().runTask(this, () -> {
+            if (!victim.isValid()) return;
+            Vector v = victim.getVelocity();
+            victim.setVelocity(new Vector(v.getX() * (1.0 - cut), v.getY(), v.getZ() * (1.0 - cut)));
+        });
+    }
+
     // ------------------------------------------------------------------ pillar assist
 
-    /** True if this player's jump can't clear a full block. */
     private boolean needsPillarAssist(Player p) {
         Stat g = findStat("gravity"), j = findStat("jump_strength");
         if (g == null || j == null || g.attr == null || j.attr == null) return false;
@@ -418,23 +546,16 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         return switch (s.kind) {
             case MULT -> 1.0;
             case ABS -> base;
-            case ADD -> 0.0;
+            case ADD -> s.levels[LEVELS / 2];
         };
     }
 
+    /** Fractional deviation from normal (0.1 = +10%). */
     private double devOf(Stat s, double v, double base) {
         return switch (s.kind) {
             case MULT -> v - 1.0;
             case ABS -> base == 0 ? 0 : v / base - 1.0;
-            case ADD -> base == 0 ? 0 : v / base;
-        };
-    }
-
-    private double valueOfDev(Stat s, double dev, double base) {
-        return switch (s.kind) {
-            case MULT -> 1.0 + dev;
-            case ABS -> base * (1.0 + dev);
-            case ADD -> dev * base;
+            case ADD -> (v - s.levels[LEVELS / 2]) / s.unit;
         };
     }
 
@@ -455,10 +576,15 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         };
     }
 
+    private boolean isRolled(Player p, Stat s) {
+        AttributeInstance inst = p.getAttribute(s.attr);
+        return inst != null && findModifier(inst, keyFor(s.id)) != null;
+    }
+
     private void applyStat(Player p, Stat s, double v) {
         AttributeInstance inst = p.getAttribute(s.attr);
         if (inst == null) return;
-        v = Math.max(s.lo, Math.min(s.hi, v));
+        v = Math.max(s.lo(), Math.min(s.hi(), v));
         v = Math.round(v * 1000.0) / 1000.0;
 
         NamespacedKey key = keyFor(s.id);
@@ -474,7 +600,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         inst.addModifier(mod);
     }
 
-    // ------------------------------------------------------------------ randomness / pity
+    // ------------------------------------------------------------------ levels
 
     private double rand() {
         return ThreadLocalRandom.current().nextDouble();
@@ -484,110 +610,123 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         return hi <= lo ? lo : lo + rand() * (hi - lo);
     }
 
-    /** -1 (worst end of the range) .. +1 (best end). */
-    private double pos(Stat s, double v) {
-        if (s.hi <= s.lo) return 0;
-        if (s.good == Good.CENTER) {
-            double n = neutral(s, 1.0);
-            double maxDist = Math.max(Math.abs(s.lo - n), Math.abs(s.hi - n));
-            if (maxDist <= 0) return 1.0;
-            return (1.0 - Math.min(1.0, Math.abs(v - n) / maxDist)) * 2.0 - 1.0;
+    /** Index of the level closest to v. Ties go towards the middle (standard) level. */
+    private int nearestIdx(Stat s, double v) {
+        int[] order = {2, 1, 3, 0, 4};
+        int best = 2;
+        for (int i : order) {
+            if (Math.abs(s.levels[i] - v) < Math.abs(s.levels[best] - v) - 1e-12) best = i;
         }
-        double t = (v - s.lo) / (s.hi - s.lo);
-        t = Math.max(0, Math.min(1, t));
-        return (s.good == Good.LOW ? 1.0 - t : t) * 2.0 - 1.0;
+        return best;
+    }
+
+    /** 0 (poor) .. 4 (excellent) for level index idx. A level equal to the standard value always counts as average. */
+    private int quality(Stat s, int idx) {
+        if (Math.abs(s.levels[idx] - s.levels[LEVELS / 2]) < 1e-9) return LEVELS / 2;
+        return s.good == Good.LOW ? (LEVELS - 1 - idx) : idx;
+    }
+
+    private boolean sameLevel(Stat s, int a, int b) {
+        return Math.abs(s.levels[a] - s.levels[b]) < 1e-9;
+    }
+
+    /** -1 .. +1 */
+    private double posOfIdx(Stat s, int idx) {
+        return (quality(s, idx) - 2) / 2.0;
+    }
+
+    private int neutralIdx(Player p, Stat s) {
+        return nearestIdx(s, neutral(s, baseOf(p, s)));
+    }
+
+    private int bestIdx(Stat s) {
+        return s.good == Good.LOW ? 0 : LEVELS - 1;
     }
 
     private double pityOf(double avgPos) {
         return Math.max(0.0, -avgPos) * pityStrength();
     }
 
-    private double draw(Stat s, double pity) {
-        double u = rand();
-        if (s.good == Good.CENTER) {
-            double v = s.lo + u * (s.hi - s.lo);
-            double f = pity / (1.0 + pity);
-            return v + (neutral(s, 1.0) - v) * f;
+    /** Picks a level index. Pity skews towards better levels; avoid (>=0) makes that level unlikely. */
+    private int pickIndex(Stat s, double pity, int avoid) {
+        double[] w = new double[LEVELS];
+        double total = 0;
+        for (int i = 0; i < LEVELS; i++) {
+            double k = (s.good == Good.NEUTRAL) ? 0 : pity * posOfIdx(s, i) * 2.0;
+            w[i] = Math.exp(k);
+            if (avoid >= 0 && sameLevel(s, i, avoid)) w[i] *= 0.02;
+            total += w[i];
         }
-        if (pity > 0 && s.good != Good.NEUTRAL) u = Math.pow(u, 1.0 / (1.0 + pity));
-        return s.good == Good.LOW ? s.hi - u * (s.hi - s.lo) : s.lo + u * (s.hi - s.lo);
-    }
-
-    // ------------------------------------------------------------------ balancing (weighted, multiplicative)
-
-    private double sum(double[] a) {
-        double t = 0;
-        for (double x : a) t += x;
-        return t;
-    }
-
-    private void fit(double[] s, double[] lo, double[] hi, boolean[] lock, double target) {
-        for (int it = 0; it < 64; it++) {
-            double diff = target - sum(s);
-            if (Math.abs(diff) < 1e-9) return;
-            int free = 0;
-            for (int i = 0; i < s.length; i++) {
-                if (!lock[i] && (diff > 0 ? s[i] < hi[i] - 1e-12 : s[i] > lo[i] + 1e-12)) free++;
-            }
-            if (free == 0) return;
-            double d = diff / free;
-            for (int i = 0; i < s.length; i++) {
-                if (!lock[i] && (diff > 0 ? s[i] < hi[i] - 1e-12 : s[i] > lo[i] + 1e-12)) {
-                    s[i] = Math.max(lo[i], Math.min(hi[i], s[i] + d));
-                }
-            }
+        double r = rand() * total;
+        for (int i = 0; i < LEVELS; i++) {
+            r -= w[i];
+            if (r <= 0) return i;
         }
+        return LEVELS - 1;
     }
+
+    // ------------------------------------------------------------------ balancing (5 levels, weighted, multiplicative)
 
     /**
-     * Keeps a group's weighted product within 1 +/- tol: sum(weight * sign * ln(multiplier)) within +/- ln(1+tol).
-     * Good-low stats (gravity etc.) count inverted. A locked stat keeps its value and the others absorb the change.
+     * Enumerates every combination of levels of a group whose weighted product stays within 1 +/- tol:
+     * |sum(weight * sign * ln(multiplier))| <= ln(1 + tol)   (good-low stats count inverted).
+     * Picks one at random. Pity favours better combinations. If {@code current} is given (single reroll)
+     * combos that change fewer other stats are preferred and the target stat should change.
+     * Returns null if no combination qualifies.
      */
-    private void balance(Player p, Map<Stat, Double> vals, List<Stat> members, double tol, double pity, Stat locked) {
+    private int[] pickCombo(Player p, List<Stat> members, double tol, int[] fixed, double pity, int[] current, int target) {
         int n = members.size();
-        if (n == 0) return;
-        double[] x = new double[n], lo = new double[n], hi = new double[n], base = new double[n], k = new double[n];
-        boolean[] lock = new boolean[n];
-
+        double[][] x = new double[n][LEVELS];
         for (int i = 0; i < n; i++) {
             Stat st = members.get(i);
-            base[i] = baseOf(p, st);
-            k[i] = st.weight * st.sign();
-            x[i] = k[i] * ln(1.0 + devOf(st, vals.get(st), base[i]));
-            double a = k[i] * ln(1.0 + devOf(st, st.lo, base[i]));
-            double b = k[i] * ln(1.0 + devOf(st, st.hi, base[i]));
-            lo[i] = Math.min(a, b);
-            hi[i] = Math.max(a, b);
-            lock[i] = (st == locked);
+            double base = baseOf(p, st);
+            for (int l = 0; l < LEVELS; l++) {
+                x[i][l] = st.weight * st.sign() * ln(1.0 + devOf(st, st.levels[l], base));
+            }
         }
-
         double limit = Math.log(1.0 + tol);
-        if (Math.abs(sum(x)) > limit) {
-            double target;
-            if (locked == null) {
-                double u = Math.pow(rand(), 1.0 / (1.0 + pity));
-                target = -limit + u * 2.0 * limit;
-            } else {
-                target = Math.max(-limit, Math.min(limit, sum(x)));
-            }
-            fit(x, lo, hi, lock, target);
-            if (Math.abs(sum(x)) > limit + 1e-9) {
-                Arrays.fill(lock, false);
-                fit(x, lo, hi, lock, target);
-            }
-            if (Math.abs(sum(x)) > limit + 1e-9) {
-                for (int i = 0; i < n; i++) x[i] = Math.max(lo[i], Math.min(hi[i], 0.0));
-            }
-        }
 
-        for (int i = 0; i < n; i++) {
-            Stat st = members.get(i);
-            double m = Math.exp(x[i] / k[i]);
-            vals.put(st, valueOfDev(st, m - 1.0, base[i]));
+        int total = 1;
+        for (int i = 0; i < n; i++) total *= LEVELS;
+
+        List<int[]> combos = new ArrayList<>();
+        List<Double> weights = new ArrayList<>();
+        double wsum = 0;
+        for (int code = 0; code < total; code++) {
+            int[] idx = new int[n];
+            int c = code;
+            boolean ok = true;
+            double sum = 0, posSum = 0;
+            for (int i = 0; i < n; i++) {
+                idx[i] = c % LEVELS;
+                c /= LEVELS;
+                if (fixed != null && fixed[i] >= 0 && fixed[i] != idx[i]) { ok = false; break; }
+                sum += x[i][idx[i]];
+                posSum += posOfIdx(members.get(i), idx[i]);
+            }
+            if (!ok || Math.abs(sum) > limit) continue;
+
+            double w = Math.exp(pity * 2.0 * (posSum / n));
+            if (current != null) {
+                int changed = 0;
+                for (int i = 0; i < n; i++) if (i != target && !sameLevel(members.get(i), idx[i], current[i])) changed++;
+                w *= Math.exp(-2.0 * changed);
+                if (target >= 0 && sameLevel(members.get(target), idx[target], current[target])) w *= 0.02;
+            }
+            combos.add(idx);
+            weights.add(w);
+            wsum += w;
         }
+        if (combos.isEmpty()) return null;
+
+        double r = rand() * wsum;
+        for (int i = 0; i < combos.size(); i++) {
+            r -= weights.get(i);
+            if (r <= 0) return combos.get(i);
+        }
+        return combos.get(combos.size() - 1);
     }
 
-    /** Net balance of the rolled values of a group, as a fraction (0.03 = +3%). */
     private double netOf(Player p, String group) {
         double net = 0;
         for (Stat st : members(group)) {
@@ -596,15 +735,17 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         return Math.exp(net) - 1.0;
     }
 
-    /** Power of final (bonus-included) values: product of weighted multipliers. */
     private double power(Player p, String group) {
         double sum = 0;
         for (Stat s : stats) {
             if (!s.counted()) continue;
             if (group != null && !group.equals(s.group)) continue;
             AttributeInstance inst = p.getAttribute(s.attr);
-            if (inst == null || inst.getBaseValue() == 0) continue;
-            sum += s.weight * s.sign() * ln(inst.getValue() / inst.getBaseValue());
+            if (inst == null) continue;
+            double base = inst.getBaseValue();
+            double m = (s.kind == Kind.ADD) ? 1.0 + (inst.getValue() - s.levels[LEVELS / 2]) / s.unit
+                    : (base != 0 ? inst.getValue() / base : 1.0);
+            sum += s.weight * s.sign() * ln(m);
         }
         return Math.exp(sum);
     }
@@ -612,55 +753,73 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     // ------------------------------------------------------------------ rolling
 
     private void rollAll(Player p) {
-        List<Stat> order = new ArrayList<>(rollable());
-        Collections.shuffle(order);
-
-        Map<Stat, Double> vals = new LinkedHashMap<>();
+        Map<Stat, Integer> picked = new LinkedHashMap<>();
         double posSum = 0;
         int posN = 0;
-        for (Stat st : order) {
-            double pity = (posN == 0) ? 0 : pityOf(posSum / posN);
-            double v = draw(st, pity);
-            vals.put(st, v);
-            if (st.good != Good.NEUTRAL) {
-                posSum += pos(st, v);
+
+        // independent and neutral stats first
+        List<Stat> loose = new ArrayList<>(rollable().stream().filter(s -> !s.counted()).toList());
+        Collections.shuffle(loose);
+        for (Stat s : loose) {
+            double pity = posN == 0 ? 0 : pityOf(posSum / posN);
+            int idx = pickIndex(s, pity, -1);
+            picked.put(s, idx);
+            if (s.good != Good.NEUTRAL) {
+                posSum += posOfIdx(s, idx);
                 posN++;
             }
         }
-        double finalPity = posN == 0 ? 0 : pityOf(posSum / posN);
 
-        // Jackpot: one stat is pushed to its best possible value; the balance step makes the others pay for it.
+        // jackpot: one stat is locked to its best level, the rest of its group has to pay for it
         Stat jackpot = null;
         if (getConfig().getBoolean("jackpot.enabled", true) && rand() < getConfig().getDouble("jackpot.chance", 0.03)) {
-            List<Stat> cands = order.stream().filter(Stat::counted).toList();
-            if (!cands.isEmpty()) {
-                jackpot = cands.get(ThreadLocalRandom.current().nextInt(cands.size()));
-                vals.put(jackpot, jackpot.good == Good.LOW ? jackpot.lo : jackpot.hi);
+            List<Stat> cands = rollable().stream().filter(Stat::counted).toList();
+            if (!cands.isEmpty()) jackpot = cands.get(ThreadLocalRandom.current().nextInt(cands.size()));
+        }
+
+        List<String> order = new ArrayList<>(GROUPS);
+        Collections.shuffle(order);
+        for (String group : order) {
+            List<Stat> mem = members(group);
+            if (mem.isEmpty()) continue;
+            double pity = posN == 0 ? 0 : pityOf(posSum / posN);
+
+            int[] fixed = new int[mem.size()];
+            Arrays.fill(fixed, -1);
+            boolean hasJackpot = jackpot != null && group.equals(jackpot.group);
+            if (hasJackpot) fixed[mem.indexOf(jackpot)] = bestIdx(jackpot);
+
+            int[] pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1);
+            if (pick == null && hasJackpot) { // the group cannot afford this jackpot
+                jackpot = null;
+                Arrays.fill(fixed, -1);
+                pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1);
+            }
+            if (pick == null) {
+                pick = new int[mem.size()];
+                for (int i = 0; i < pick.length; i++) pick[i] = neutralIdx(p, mem.get(i));
+            }
+            for (int i = 0; i < pick.length; i++) {
+                picked.put(mem.get(i), pick[i]);
+                posSum += posOfIdx(mem.get(i), pick[i]);
+                posN++;
             }
         }
 
-        for (String group : GROUPS) {
-            Stat lockedHere = (jackpot != null && group.equals(jackpot.group)) ? jackpot : null;
-            balance(p, vals, members(group), tolerance(group), finalPity, lockedHere);
-        }
-
-        for (var e : vals.entrySet()) applyStat(p, e.getKey(), e.getValue());
+        for (var e : picked.entrySet()) applyStat(p, e.getKey(), e.getKey().levels[e.getValue()]);
         rerollLinkOffsets(p);
         clearLowHealthChoice(p);
 
         PersistentDataContainer pdc = p.getPersistentDataContainer();
-        if (jackpot != null) {
-            pdc.set(keyFor("jackpot_stat"), PersistentDataType.STRING, jackpot.id);
-        } else {
-            pdc.remove(keyFor("jackpot_stat"));
-        }
+        if (jackpot != null) pdc.set(keyFor("jackpot_stat"), PersistentDataType.STRING, jackpot.id);
+        else pdc.remove(keyFor("jackpot_stat"));
         finish(p);
 
         if (jackpot != null) {
-            p.sendMessage(Component.text("JACKPOT! " + jackpot.id + " rolled its best possible value (the others paid for it).",
+            p.sendMessage(Component.text("JACKPOT! " + pretty(jackpot.id) + " rolled its best possible level (the others paid for it).",
                     NamedTextColor.LIGHT_PURPLE));
             if (getConfig().getBoolean("jackpot.broadcast", true)) {
-                Bukkit.getServer().broadcast(Component.text(p.getName() + " hit the JACKPOT on " + jackpot.id + "!",
+                Bukkit.getServer().broadcast(Component.text(p.getName() + " hit the JACKPOT on " + pretty(jackpot.id) + "!",
                         NamedTextColor.LIGHT_PURPLE));
             }
         }
@@ -673,20 +832,24 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         int posN = 0;
         for (Stat o : rollable()) {
             if (o == st || o.good == Good.NEUTRAL) continue;
-            posSum += pos(o, current(p, o));
+            posSum += posOfIdx(o, nearestIdx(o, current(p, o)));
             posN++;
         }
         double pity = posN == 0 ? 0 : pityOf(posSum / posN);
-        double v = draw(st, pity);
 
         if (st.counted()) {
-            List<Stat> members = members(st.group);
-            Map<Stat, Double> vals = new LinkedHashMap<>();
-            for (Stat m : members) vals.put(m, m == st ? v : current(p, m));
-            balance(p, vals, members, tolerance(st.group), pity, st);
-            for (var e : vals.entrySet()) applyStat(p, e.getKey(), e.getValue());
+            List<Stat> mem = members(st.group);
+            int[] cur = new int[mem.size()];
+            for (int i = 0; i < cur.length; i++) cur[i] = nearestIdx(mem.get(i), current(p, mem.get(i)));
+            int[] pick = pickCombo(p, mem, tolerance(st.group), null, pity, cur, mem.indexOf(st));
+            if (pick == null) {
+                rollAll(p);
+                return;
+            }
+            for (int i = 0; i < pick.length; i++) applyStat(p, mem.get(i), mem.get(i).levels[pick[i]]);
         } else {
-            applyStat(p, st, v);
+            int avoid = isRolled(p, st) ? nearestIdx(st, current(p, st)) : -1;
+            applyStat(p, st, st.levels[pickIndex(st, pity, avoid)]);
         }
 
         final String rolledId = st.id;
@@ -708,11 +871,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private void finish(Player p) {
         linkStats(p);
         applyScaleBonus(p);
-        applyFrictionCompensation(p);
         applyScaleTradeoffs(p);
         applyLowHealthBonus(p);
         fixJump(p);
         applyTitle(p);
+        updateNegatives(p);
         AttributeInstance hp = p.getAttribute(Attribute.MAX_HEALTH);
         if (hp != null) p.setHealth(hp.getValue());
     }
@@ -724,8 +887,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         PersistentDataContainer pdc = p.getPersistentDataContainer();
         Double stored = pdc.get(key, PersistentDataType.DOUBLE);
         if (stored == null || reroll) {
-            double lo = getConfig().getDouble("block-reach-bonus.min", 0.5);
-            double hi = getConfig().getDouble("block-reach-bonus.max", 1.0);
+            double lo = getConfig().getDouble("block-reach-bonus.min", 1.0);
+            double hi = getConfig().getDouble("block-reach-bonus.max", 2.0);
             if (hi < lo) { double tmp = lo; lo = hi; hi = tmp; }
             stored = Math.round(uniform(lo, hi) * 100.0) / 100.0;
             pdc.set(key, PersistentDataType.DOUBLE, stored);
@@ -787,42 +950,6 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
     }
 
-    /**
-     * Estimated top-speed ratio on the ground for a friction_modifier of m (1.0 = normal), assuming the
-     * modifier scales the per-tick speed loss (vanilla ground: 54.6% of speed is kept each tick).
-     * Above 1.0 you top out slower, below 1.0 you slide faster.
-     */
-    private double frictionRatio(double m) {
-        double d = 0.454 * m;
-        d = Math.max(0.05, Math.min(0.98, d));
-        return ((1.0 - d) / d) / (0.546 / 0.454);
-    }
-
-    private double frictionOf(Player p) {
-        Stat fr = findStat("friction_modifier");
-        if (fr == null || fr.attr == null) return 1.0;
-        return current(p, fr);
-    }
-
-    /** Cancels the top-speed lost to high friction, so a speed roll still feels like the buff it is. */
-    private void applyFrictionCompensation(Player p) {
-        Stat sp = findStat("movement_speed");
-        if (sp == null || sp.attr == null) return;
-        AttributeInstance inst = p.getAttribute(sp.attr);
-        if (inst == null) return;
-        removeMod(p, sp.attr, FRICTION_COMP_ID);
-
-        double m = frictionOf(p);
-        if (Math.abs(m - 1.0) < 1e-6) return;
-        double r = frictionRatio(m);
-        double strength = r < 1.0
-                ? getConfig().getDouble("friction-compensation.high-friction", 1.0)
-                : getConfig().getDouble("friction-compensation.low-friction", 0.5);
-        double c = Math.pow(r, -strength);
-        inst.addModifier(new AttributeModifier(keyFor(FRICTION_COMP_ID), c - 1.0,
-                AttributeModifier.Operation.MULTIPLY_SCALAR_1));
-    }
-
     /** Big players resist knockback; small players are more fragile. */
     private void applyScaleTradeoffs(Player p) {
         Attribute kb = Registry.ATTRIBUTE.get(NamespacedKey.minecraft("knockback_resistance"));
@@ -852,7 +979,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
     private List<Stat> lowHealthCandidates() {
         List<String> ids = getConfig().getStringList("low-health-bonus.stats");
-        if (ids.isEmpty()) ids = List.of("attack_damage", "attack_speed");
+        if (ids.isEmpty()) ids = List.of("attack_knockback", "attack_speed");
         List<Stat> out = new ArrayList<>();
         for (String id : ids) {
             Stat s = findStat(id);
@@ -901,7 +1028,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
         AttributeInstance inst = p.getAttribute(chosen.attr);
         if (inst != null) {
-            inst.addModifier(new AttributeModifier(keyFor(LOW_HP_ID), val, AttributeModifier.Operation.ADD_SCALAR));
+            AttributeModifier mod = (chosen.kind == Kind.ADD)
+                    ? new AttributeModifier(keyFor(LOW_HP_ID), val * chosen.unit, AttributeModifier.Operation.ADD_NUMBER)
+                    : new AttributeModifier(keyFor(LOW_HP_ID), val, AttributeModifier.Operation.ADD_SCALAR);
+            inst.addModifier(mod);
         }
     }
 
@@ -917,6 +1047,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         return peak;
     }
 
+    /** Raises step height to 1.0 for weak jumpers - but never while sneaking. */
     private void fixJump(Player p) {
         Attribute stepAttr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft(STEP_ID));
         if (stepAttr == null) return;
@@ -924,6 +1055,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         if (step == null) return;
 
         removeMod(p, stepAttr, STEP_ID);
+        if (p.isSneaking()) return;
 
         Stat g = findStat("gravity"), j = findStat("jump_strength");
         if (g == null || j == null || g.attr == null || j.attr == null) return;
@@ -942,49 +1074,71 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     // ------------------------------------------------------------------ titles
 
     private boolean hasRolls(Player p) {
-        for (Stat s : rollable()) {
-            AttributeInstance inst = p.getAttribute(s.attr);
-            if (inst != null && findModifier(inst, keyFor(s.id)) != null) return true;
-        }
+        for (Stat s : rollable()) if (isRolled(p, s)) return true;
         return false;
     }
 
+    /**
+     * Archetype title. Looks at the player's strongest and weakest stats (group stats by their balanced weight,
+     * independent stats like oxygen / block break speed by their level) and names the build.
+     */
     private String computeTitle(Player p) {
         Stat dom = null, worst = null;
         double domX = 0, worstX = 0;
         for (Stat s : stats) {
-            if (!s.counted()) continue;
-            double x = s.weight * s.sign() * ln(1.0 + devOf(s, current(p, s), baseOf(p, s)));
+            if (s.attr == null || s.linkedTo != null || s.good == Good.NEUTRAL) continue;
+            double x;
+            if (s.counted()) {
+                x = s.weight * s.sign() * ln(1.0 + devOf(s, current(p, s), baseOf(p, s)));
+                if (worst == null || x < worstX) { worst = s; worstX = x; }
+            } else {
+                if (!isRolled(p, s)) continue;
+                x = (quality(s, nearestIdx(s, current(p, s))) - 2) * 0.15;
+            }
             if (dom == null || x > domX) { dom = s; domX = x; }
-            if (worst == null || x < worstX) { worst = s; worstX = x; }
         }
 
         String name;
         if (dom == null || domX < 0.06) {
             name = "Everyman";
         } else {
-            name = switch (dom.id) {
-                case "entity_interaction_range" -> "Lancer";
-                case "attack_speed" -> "Duelist";
-                case "attack_damage" -> (worst != null && worst.id.equals("max_health")) ? "Glass Cannon" : "Brute";
-                case "max_health" -> "Tank";
-                case "gravity" -> "Feather";
-                case "jump_strength" -> "Leaper";
-                case "movement_speed" -> "Sprinter";
-                case "safe_fall_distance" -> "Acrobat";
-                case "fall_damage_multiplier" -> "Cushioned";
-                case "burning_time" -> "Fireproof";
-                case "sneaking_speed" -> "Shadow";
-                default -> "Wanderer";
-            };
+            String top = dom.id;
+            String low = (worst != null && worstX < -0.05) ? worst.id : "";
+            boolean offence = top.equals("attack_knockback") || top.equals("attack_speed") || top.equals("entity_interaction_range");
+            boolean agile = top.equals("movement_speed") || top.equals("jump_strength") || top.equals("gravity");
+            if (offence && low.equals("max_health")) {
+                name = "Glass Cannon";
+            } else if (top.equals("max_health")
+                    && (low.equals("movement_speed") || low.equals("attack_speed") || low.equals("jump_strength"))) {
+                name = "Juggernaut";
+            } else if (agile && low.equals("max_health")) {
+                name = "Scout";
+            } else {
+                name = switch (top) {
+                    case "entity_interaction_range" -> "Lancer";
+                    case "attack_speed" -> "Duelist";
+                    case "attack_knockback" -> "Bruiser";
+                    case "max_health" -> "Tank";
+                    case "gravity" -> "Featherweight";
+                    case "jump_strength" -> "Leaper";
+                    case "movement_speed" -> "Sprinter";
+                    case "safe_fall_distance" -> "Acrobat";
+                    case "fall_damage_multiplier" -> "Stuntman";
+                    case "burning_time" -> "Fireproof";
+                    case "sneaking_speed" -> "Shadow";
+                    case "block_break_speed" -> "Digger";
+                    case "oxygen_bonus", "submerged_mining_speed" -> "Diver";
+                    default -> "Wanderer";
+                };
+            }
         }
 
         String prefix = "";
         Stat sc = findStat("scale");
-        if (sc != null && sc.attr != null) {
-            double v = current(p, sc);
-            if (v >= 1.1) prefix = "Giant ";
-            else if (v <= 0.9) prefix = "Tiny ";
+        if (sc != null && sc.attr != null && isRolled(p, sc)) {
+            int si = nearestIdx(sc, current(p, sc));
+            if (si == LEVELS - 1) prefix = "Giant ";
+            else if (si == 0) prefix = "Tiny ";
         }
         if (p.getPersistentDataContainer().get(keyFor("jackpot_stat"), PersistentDataType.STRING) != null) {
             prefix = "JACKPOT " + prefix;
@@ -992,13 +1146,47 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         return prefix + name;
     }
 
+    private NamedTextColor titleColor(String title) {
+        if (title.startsWith("JACKPOT")) return NamedTextColor.LIGHT_PURPLE;
+        if (title.contains("Glass Cannon")) return NamedTextColor.DARK_RED;
+        if (title.contains("Juggernaut")) return NamedTextColor.DARK_PURPLE;
+        if (title.contains("Scout")) return NamedTextColor.AQUA;
+        if (title.contains("Bruiser")) return NamedTextColor.RED;
+        if (title.contains("Lancer")) return NamedTextColor.DARK_AQUA;
+        if (title.contains("Duelist")) return NamedTextColor.GOLD;
+        if (title.contains("Tank")) return NamedTextColor.DARK_GREEN;
+        if (title.contains("Featherweight")) return NamedTextColor.WHITE;
+        if (title.contains("Leaper")) return NamedTextColor.GREEN;
+        if (title.contains("Sprinter")) return NamedTextColor.YELLOW;
+        if (title.contains("Acrobat")) return NamedTextColor.BLUE;
+        if (title.contains("Stuntman")) return NamedTextColor.DARK_BLUE;
+        if (title.contains("Fireproof")) return NamedTextColor.RED;
+        if (title.contains("Shadow")) return NamedTextColor.DARK_GRAY;
+        if (title.contains("Digger")) return NamedTextColor.GOLD;
+        if (title.contains("Diver")) return NamedTextColor.BLUE;
+        if (title.contains("Everyman")) return NamedTextColor.GRAY;
+        return NamedTextColor.AQUA;
+    }
+
+    /** "[Title]" in the title's colour. */
+    private Component titleTag(Player p) {
+        String title = computeTitle(p);
+        Component c = Component.text("[" + title + "]", titleColor(title));
+        if (title.startsWith("JACKPOT")) c = c.decorate(TextDecoration.BOLD);
+        return c;
+    }
+
     private void applyTitle(Player p) {
-        if (!getConfig().getBoolean("titles.tab-list", true)) return;
         if (!hasRolls(p)) {
-            p.playerListName(null);
+            titleCache.remove(p.getUniqueId());
+            if (getConfig().getBoolean("titles.tab-list", true)) p.playerListName(null);
             return;
         }
-        p.playerListName(Component.text(p.getName() + " [" + computeTitle(p) + "]"));
+        Component tag = titleTag(p);
+        titleCache.put(p.getUniqueId(), tag);
+        if (getConfig().getBoolean("titles.tab-list", true)) {
+            p.playerListName(Component.text(p.getName() + " ").append(tag));
+        }
     }
 
     // ------------------------------------------------------------------ player-driven reroll
@@ -1016,8 +1204,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private Snapshot takeSnapshot(Player p) {
         Snapshot s = new Snapshot();
         for (Stat st : rollable()) {
-            AttributeInstance inst = p.getAttribute(st.attr);
-            if (inst != null && findModifier(inst, keyFor(st.id)) != null) s.vals.put(st.id, current(p, st));
+            if (isRolled(p, st)) s.vals.put(st.id, current(p, st));
         }
         PersistentDataContainer pdc = p.getPersistentDataContainer();
         for (String k : dblKeys()) {
@@ -1051,6 +1238,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         finish(p);
     }
 
+    private int rerollCost() {
+        return getConfig().getInt("player-reroll.xp-levels", 100);
+    }
+
     private void handleRoll(Player p, String what) {
         if (!getConfig().getBoolean("player-reroll.enabled", true)) {
             p.sendMessage(Component.text("Rerolling is disabled on this server.", NamedTextColor.RED));
@@ -1063,7 +1254,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
         UUID id = p.getUniqueId();
         if (pending.containsKey(id)) {
-            p.sendMessage(Component.text("Choose /gamble keep or /gamble revert for your last reroll first.", NamedTextColor.RED));
+            p.sendMessage(Component.text("Choose KEEP or REVERT for your last reroll first (open /gamble).", NamedTextColor.RED));
             return;
         }
 
@@ -1079,7 +1270,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             return;
         }
 
-        int cost = getConfig().getInt("player-reroll.xp-levels", 5);
+        int cost = rerollCost();
         boolean pays = cost > 0 && p.getGameMode() != GameMode.CREATIVE;
         if (pays && p.getLevel() < cost) {
             p.sendMessage(Component.text("A reroll costs " + cost + " XP levels.", NamedTextColor.RED));
@@ -1095,7 +1286,9 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         rollOne(p, st);
 
         int secs = Math.max(3, getConfig().getInt("player-reroll.decision-seconds", 10));
-        Bukkit.getScheduler().runTask(this, () -> openMenu(p, p));
+        Stat shown = st.linkedTo != null ? findStat(st.linkedTo) : st;
+        if (animationEnabled() && shown != null) playReel(p, shown, () -> openMenu(p, p));
+        else Bukkit.getScheduler().runTask(this, () -> openMenu(p, p));
         p.sendMessage(Component.text("Keep the new roll? (" + secs + "s)  ", NamedTextColor.GOLD)
                 .append(Component.text("[KEEP]", NamedTextColor.GREEN).clickEvent(ClickEvent.runCommand("/gamble keep")))
                 .append(Component.text("  "))
@@ -1106,95 +1299,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 pending.remove(id);
                 if (p.isOnline()) p.sendMessage(Component.text("Time's up - you kept the new roll.", NamedTextColor.GRAY));
             }
-        }, secs * 20L);
-    }
-
-    // ------------------------------------------------------------------ display
-
-    private void sendStats(CommandSender to, Player target) {
-        to.sendMessage(Component.text("--- " + target.getName() + "'s gambled stats ---", NamedTextColor.GOLD));
-        if (hasRolls(target)) {
-            to.sendMessage(Component.text("Title: " + computeTitle(target), NamedTextColor.LIGHT_PURPLE));
-        }
-
-        for (Stat s : available()) {
-            AttributeInstance inst = target.getAttribute(s.attr);
-            if (inst == null) continue;
-            double normal = inst.getBaseValue();
-            double now = inst.getValue();
-            double delta = now - normal;
-
-            String text;
-            if (normal != 0) {
-                text = String.format("%s: %.3f -> %.3f (%+.0f%%)", s.id, normal, now, (now / normal - 1.0) * 100.0);
-            } else {
-                text = String.format("%s: %.2f (%+.2f)", s.id, now, delta);
-            }
-
-            NamedTextColor c = NamedTextColor.GRAY;
-            if (Math.abs(delta) > 1e-6) {
-                boolean up = delta > 0;
-                if (s.good == Good.NEUTRAL) {
-                    c = NamedTextColor.AQUA;
-                } else if (s.good == Good.CENTER) {
-                    double off = normal == 0 ? 0 : Math.abs(delta / normal);
-                    c = off <= 0.05 ? NamedTextColor.GREEN : off <= 0.12 ? NamedTextColor.YELLOW : NamedTextColor.RED;
-                } else if (s.good == Good.HIGH) {
-                    c = up ? NamedTextColor.GREEN : NamedTextColor.RED;
-                } else {
-                    c = up ? NamedTextColor.RED : NamedTextColor.GREEN;
-                }
-            }
-            to.sendMessage(Component.text(text, c));
-        }
-
-        double scaleBonus = scaleBonusAmount(target);
-        if (scaleBonus > 0) {
-            to.sendMessage(Component.text(String.format("scale bonus: +%.0f%% movement speed (scale above 1.0)",
-                    scaleBonus * 100.0), NamedTextColor.YELLOW));
-        }
-        if (lowHealth(target)) {
-            PersistentDataContainer pdc = target.getPersistentDataContainer();
-            String id = pdc.get(keyFor("low_hp_stat"), PersistentDataType.STRING);
-            Double val = pdc.get(keyFor("low_hp_value"), PersistentDataType.DOUBLE);
-            if (id != null && val != null) {
-                to.sendMessage(Component.text(String.format("low health bonus: +%.0f%% %s", val * 100.0, id), NamedTextColor.YELLOW));
-            }
-        }
-
-        Stat g = findStat("gravity"), j = findStat("jump_strength");
-        if (g != null && j != null && g.attr != null && j.attr != null) {
-            AttributeInstance gi = target.getAttribute(g.attr), ji = target.getAttribute(j.attr);
-            if (gi != null && ji != null) {
-                double peak = jumpPeak(gi.getValue(), ji.getValue());
-                String extra = "";
-                Attribute stepAttr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft(STEP_ID));
-                if (stepAttr != null) {
-                    AttributeInstance st = target.getAttribute(stepAttr);
-                    if (st != null) extra = String.format(", step height %.2f", st.getValue());
-                }
-                to.sendMessage(Component.text(String.format("jump height ~%.2f blocks%s", peak, extra), NamedTextColor.YELLOW));
-                if (needsPillarAssist(target) && getConfig().getBoolean("pillar-assist.enabled", true)) {
-                    to.sendMessage(Component.text("pillar assist: sneak + look down + right-click with a block to build up",
-                            NamedTextColor.YELLOW));
-                }
-            }
-        }
-
-        for (String group : GROUPS) {
-            if (members(group).isEmpty()) continue;
-            to.sendMessage(Component.text(String.format("%s balance: %+.1f%% (limit +/-%.0f%%)",
-                    group, netOf(target, group) * 100.0, tolerance(group) * 100.0), NamedTextColor.DARK_AQUA));
-        }
-    }
-
-    private void sendPower(CommandSender to, Player target) {
-        to.sendMessage(Component.text("--- " + target.getName() + "'s power (1.00 = average) ---", NamedTextColor.GOLD));
-        for (String group : GROUPS) {
-            if (members(group).isEmpty()) continue;
-            to.sendMessage(Component.text(String.format("%s power: x%.2f", group, power(target, group)), NamedTextColor.GRAY));
-        }
-        to.sendMessage(Component.text(String.format("total power: x%.2f", power(target, null)), NamedTextColor.GREEN));
+        }, secs * 20L + (animationEnabled() ? ANIMATION_TICKS : 0L));
     }
 
     // ------------------------------------------------------------------ stats menu
@@ -1235,11 +1340,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     /** 0 (poor) .. 4 (excellent), -1 if not rolled yet. */
     private int ratingLevel(Player p, Stat s) {
         Stat src = s.linkedTo != null ? findStat(s.linkedTo) : s;
-        if (src == null || src.attr == null) return -1;
-        AttributeInstance inst = p.getAttribute(src.attr);
-        if (inst == null || findModifier(inst, keyFor(src.id)) == null) return -1;
-        double pos = pos(src, current(p, src));
-        return Math.max(0, Math.min(4, (int) Math.round((pos + 1.0) / 2.0 * 4.0)));
+        if (src == null || src.attr == null || !isRolled(p, src)) return -1;
+        return quality(src, nearestIdx(src, current(p, src)));
     }
 
     private int remainingRerolls(Player p) {
@@ -1261,9 +1363,9 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         lore.add(line(DESC.getOrDefault(s.id, ""), NamedTextColor.GRAY));
 
         if (s.good == Good.NEUTRAL) {
-            double v = current(target, s);
-            String size = v < 0.9 ? "Small" : v > 1.1 ? "Large" : "Medium";
-            lore.add(line("Size: " + size, NamedTextColor.AQUA));
+            String[] sizes = {"Tiny", "Small", "Medium", "Large", "Giant"};
+            int si = nearestIdx(s, current(target, s));
+            lore.add(line("Size: " + sizes[si], NamedTextColor.AQUA));
         } else {
             int level = ratingLevel(target, s);
             if (level < 0) {
@@ -1288,12 +1390,21 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 } else {
                     lore.add(line(String.format("Now %.2f (%+.2f)", now, now - normal), NamedTextColor.WHITE));
                 }
+                if (s.kind == Kind.ADD && s.linkedTo == null) {
+                    lore.add(line(String.format("Roll value %+.2f (negative = custom penalty)", current(target, s)),
+                            NamedTextColor.WHITE));
+                }
                 if (s.linkedTo != null) {
                     lore.add(line("Follows " + pretty(s.linkedTo) + " + bonus", NamedTextColor.DARK_AQUA));
                 } else {
-                    lore.add(line(String.format("Range %.2f to %.2f", s.lo, s.hi), NamedTextColor.DARK_AQUA));
-                    lore.add(line(String.format("Weight %.1f, group %s, good: %s", s.weight,
-                            s.group == null ? "none" : s.group, s.good.name().toLowerCase(Locale.ROOT)), NamedTextColor.DARK_AQUA));
+                    StringBuilder lv = new StringBuilder("Levels ");
+                    for (int i = 0; i < LEVELS; i++) {
+                        if (i > 0) lv.append(" / ");
+                        lv.append(String.format("%.2f", s.levels[i]).replaceAll("\\.?0+$", ""));
+                    }
+                    lore.add(line(lv.toString(), NamedTextColor.DARK_AQUA));
+                    lore.add(line(String.format("Weight %.1f, group %s", s.weight,
+                            s.group == null ? "none" : s.group), NamedTextColor.DARK_AQUA));
                 }
             }
         }
@@ -1323,19 +1434,6 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             Double val = pdc.get(keyFor("low_hp_value"), PersistentDataType.DOUBLE);
             if (id != null && val != null) {
                 out.add(line(String.format("Low health bonus: +%.0f%% %s", val * 100.0, pretty(id)), NamedTextColor.YELLOW));
-            }
-        }
-
-        Stat sp = findStat("movement_speed");
-        if (sp != null && sp.attr != null) {
-            AttributeInstance si = t.getAttribute(sp.attr);
-            if (si != null && si.getBaseValue() != 0) {
-                AttributeModifier fm = findModifier(si, keyFor(FRICTION_COMP_ID));
-                if (fm != null) {
-                    out.add(line(String.format("Friction speed comp: x%.2f", 1.0 + fm.getAmount()), NamedTextColor.YELLOW));
-                }
-                double est = 4.317 * (si.getValue() / si.getBaseValue()) * frictionRatio(frictionOf(t));
-                out.add(line(String.format("Est. walk speed: %.1f b/s (model)", est), NamedTextColor.YELLOW));
             }
         }
 
@@ -1377,10 +1475,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         ItemStack filler = icon(Material.GRAY_STAINED_GLASS_PANE, Component.text(" "), null);
         for (int i = 0; i < 54; i++) inv.setItem(i, filler);
 
-        // header
         List<Component> head = new ArrayList<>();
         if (hasRolls(target)) {
-            head.add(line("Title: " + computeTitle(target), NamedTextColor.LIGHT_PURPLE));
+            head.add(Component.text("Title: ", NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false)
+                    .append(titleTag(target).decoration(TextDecoration.ITALIC, false)));
             String jp = target.getPersistentDataContainer().get(keyFor("jackpot_stat"), PersistentDataType.STRING);
             if (jp != null) head.add(line("JACKPOT: " + pretty(jp), NamedTextColor.LIGHT_PURPLE));
         } else {
@@ -1388,16 +1486,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
         inv.setItem(4, icon(Material.NETHER_STAR, line(target.getName(), NamedTextColor.GOLD), head));
 
-        placeGroup(menu, target, admin, canRoll, 9, "Combat", NamedTextColor.RED, new int[]{10, 11, 12, 13, 14},
-                "entity_interaction_range", "block_interaction_range", "attack_speed", "attack_damage", "max_health");
-        placeGroup(menu, target, admin, canRoll, 18, "Mobility", NamedTextColor.GREEN, new int[]{19, 20, 21, 22, 23},
-                "gravity", "jump_strength", "movement_speed", "friction_modifier", "scale");
-        placeGroup(menu, target, admin, canRoll, 27, "Utility", NamedTextColor.YELLOW, new int[]{28, 29, 30, 31},
-                "safe_fall_distance", "fall_damage_multiplier", "burning_time", "sneaking_speed");
-        placeGroup(menu, target, admin, canRoll, 32, "Other", NamedTextColor.AQUA, new int[]{33, 34, 35},
-                "mining_efficiency", "oxygen_bonus", "water_movement_efficiency");
+        for (GroupLayout g : LAYOUT) {
+            placeGroup(menu, target, admin, canRoll, g.labelSlot(), g.label(), g.color(), g.slots(), g.ids());
+        }
 
-        // info
         List<Component> info = new ArrayList<>();
         info.add(line("Fuller bars = better rolls.", NamedTextColor.GRAY));
         info.add(line("Stats are balanced: a great roll", NamedTextColor.GRAY));
@@ -1411,7 +1503,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             int left = remainingRerolls(target);
             info.add(line("", NamedTextColor.GRAY));
             info.add(line("Shift-click a stat to reroll it", NamedTextColor.GOLD));
-            info.add(line("Cost: " + getConfig().getInt("player-reroll.xp-levels", 5) + " XP levels", NamedTextColor.GOLD));
+            info.add(line("Cost: " + rerollCost() + " XP levels", NamedTextColor.GOLD));
             info.add(line(left < 0 ? "Rerolls today: unlimited" : "Rerolls left today: " + left, NamedTextColor.GOLD));
         }
         inv.setItem(45, icon(Material.BOOK, line("How it works", NamedTextColor.WHITE), info));
@@ -1449,6 +1541,10 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
     @EventHandler
     public void onMenuClick(InventoryClickEvent e) {
+        if (e.getView().getTopInventory().getHolder() instanceof RollMenu) {
+            e.setCancelled(true);
+            return;
+        }
         if (!(e.getView().getTopInventory().getHolder() instanceof StatsMenu menu)) return;
         e.setCancelled(true);
         if (!(e.getWhoClicked() instanceof Player p)) return;
@@ -1481,7 +1577,147 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
 
     @EventHandler
     public void onMenuDrag(InventoryDragEvent e) {
-        if (e.getView().getTopInventory().getHolder() instanceof StatsMenu) e.setCancelled(true);
+        Object holder = e.getView().getTopInventory().getHolder();
+        if (holder instanceof StatsMenu || holder instanceof RollMenu) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onRollClose(InventoryCloseEvent e) {
+        if (e.getInventory().getHolder() instanceof RollMenu m) m.closed = true;
+    }
+
+    // ------------------------------------------------------------------ roulette animations
+
+    private boolean animationEnabled() {
+        return getConfig().getBoolean("animation.enabled", true);
+    }
+
+    private ItemStack reelPane(Stat s, int idx) {
+        if (s.good == Good.NEUTRAL) {
+            String[] sizes = {"Tiny", "Small", "Medium", "Large", "Giant"};
+            return icon(Material.PURPLE_STAINED_GLASS_PANE, line(sizes[idx], NamedTextColor.LIGHT_PURPLE), null);
+        }
+        int q = quality(s, idx);
+        NamedTextColor c = ratingColor(q);
+        Component name = Component.text("\u25A0".repeat(q + 1), c)
+                .append(Component.text("\u25A1".repeat(4 - q), NamedTextColor.DARK_GRAY))
+                .append(Component.text(" " + RATING_WORDS[q], c))
+                .decoration(TextDecoration.ITALIC, false);
+        return icon(PANES[q], name, null);
+    }
+
+    private ItemStack spinPane() {
+        int q = ThreadLocalRandom.current().nextInt(LEVELS);
+        return icon(PANES[q], line("Rolling...", NamedTextColor.GRAY), null);
+    }
+
+    /** Slot-machine style reel for one stat. The new value is already applied; this only reveals it. */
+    private void playReel(Player p, Stat s, Runnable after) {
+        if (!animationEnabled()) {
+            after.run();
+            return;
+        }
+        RollMenu menu = new RollMenu();
+        Inventory inv = Bukkit.createInventory(menu, 27, Component.text("Rolling " + pretty(s.id) + "..."));
+        menu.inv = inv;
+
+        ItemStack filler = icon(Material.GRAY_STAINED_GLASS_PANE, Component.text(" "), null);
+        for (int i = 0; i < 27; i++) inv.setItem(i, filler);
+        inv.setItem(4, icon(Material.YELLOW_STAINED_GLASS_PANE, line("\u25BC", NamedTextColor.YELLOW), null));
+        inv.setItem(22, icon(Material.YELLOW_STAINED_GLASS_PANE, line("\u25B2", NamedTextColor.YELLOW), null));
+        Material mat = Material.matchMaterial(ICONS.getOrDefault(s.id, "PAPER"));
+        inv.setItem(13 - 9, icon(mat == null ? Material.PAPER : mat, line(pretty(s.id), NamedTextColor.WHITE), null));
+
+        int total = 36;
+        int[] strip = new int[total];
+        for (int i = 0; i < total; i++) strip[i] = ThreadLocalRandom.current().nextInt(LEVELS);
+        int result = nearestIdx(s, current(p, s));
+        strip[total - 5] = result; // lands in the centre slot of the last window
+
+        p.openInventory(inv);
+        reelStep(p, menu, s, strip, 0, result, after);
+    }
+
+    private void reelStep(Player p, RollMenu menu, Stat s, int[] strip, int f, int result, Runnable after) {
+        if (menu.closed || !p.isOnline()) return;
+        for (int i = 0; i < 9; i++) menu.inv.setItem(9 + i, reelPane(s, strip[f + i]));
+
+        int last = strip.length - 9;
+        if (f >= last) {
+            p.playSound(p.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.8f, quality(s, result) >= 3 ? 1.4f : 0.9f);
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (!menu.closed && p.isOnline()) after.run();
+            }, 30L);
+            return;
+        }
+        p.playSound(p.getLocation(), Sound.UI_BUTTON_CLICK, 0.5f, 0.8f + 0.6f * f / last);
+        long delay = 1L + (long) ((f + 1) * 4.0 / last); // spins fast, slows to a stop
+        Bukkit.getScheduler().runTaskLater(this, () -> reelStep(p, menu, s, strip, f + 1, result, after), delay);
+    }
+
+    /** All stats spin at once and stop one after another. Results are already applied. */
+    private void playFullRoll(Player p, Runnable after) {
+        if (!animationEnabled()) {
+            after.run();
+            return;
+        }
+        RollMenu menu = new RollMenu();
+        Inventory inv = Bukkit.createInventory(menu, 54, Component.text("Rolling your stats..."));
+        menu.inv = inv;
+
+        ItemStack filler = icon(Material.GRAY_STAINED_GLASS_PANE, Component.text(" "), null);
+        for (int i = 0; i < 54; i++) inv.setItem(i, filler);
+        inv.setItem(4, icon(Material.NETHER_STAR, line("Rolling...", NamedTextColor.GOLD), null));
+
+        List<Integer> slots = new ArrayList<>();
+        List<Stat> cells = new ArrayList<>();
+        for (GroupLayout g : LAYOUT) {
+            inv.setItem(g.labelSlot(), icon(Material.PAPER, line(g.label(), g.color()), null));
+            for (int i = 0; i < g.ids().length && i < g.slots().length; i++) {
+                Stat s = findStat(g.ids()[i]);
+                if (s == null || s.attr == null) continue;
+                slots.add(g.slots()[i]);
+                cells.add(s);
+            }
+        }
+
+        final int n = cells.size();
+        final int[] tick = {0};
+        p.openInventory(inv);
+        Bukkit.getScheduler().runTaskTimer(this, task -> {
+            int t = tick[0]++;
+            if (menu.closed || !p.isOnline()) {
+                task.cancel();
+                return;
+            }
+            for (int k = 0; k < n; k++) {
+                int stopAt = 8 + 2 * k;
+                if (t < stopAt) {
+                    inv.setItem(slots.get(k), spinPane());
+                } else if (t == stopAt) {
+                    inv.setItem(slots.get(k), statItem(cells.get(k), p, false, false));
+                    p.playSound(p.getLocation(), Sound.UI_BUTTON_CLICK, 0.6f, 0.8f + 0.8f * k / n);
+                }
+            }
+            int end = 8 + 2 * n + 10;
+            if (t >= end) {
+                task.cancel();
+                p.playSound(p.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.9f, 1.0f);
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    if (!menu.closed && p.isOnline()) after.run();
+                }, 20L);
+            }
+        }, 0L, 2L);
+    }
+
+    /** Plain-text fallback for the console. */
+    private void sendStatsText(CommandSender to, Player target) {
+        to.sendMessage("--- " + target.getName() + " ---");
+        for (Stat s : available()) {
+            AttributeInstance inst = target.getAttribute(s.attr);
+            if (inst == null) continue;
+            to.sendMessage(String.format("%s: %.3f (normal %.3f)", s.id, inst.getValue(), inst.getBaseValue()));
+        }
     }
 
     // ------------------------------------------------------------------ command
@@ -1510,7 +1746,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 return true;
             }
             if (sender instanceof Player viewer) openMenu(viewer, target);
-            else sendStats(sender, target);
+            else sendStatsText(sender, target);
             return true;
         }
 
@@ -1523,16 +1759,8 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                     if (args.length < 2) return deny(sender, "Usage: /gamble roll <stat>");
                     handleRoll(p, args[1]);
                 }
-                case "keep" -> {
-                    if (pending.remove(p.getUniqueId()) == null) return deny(sender, "Nothing to keep.");
-                    p.sendMessage(Component.text("Kept your new roll.", NamedTextColor.GREEN));
-                }
-                default -> {
-                    Snapshot snap = pending.remove(p.getUniqueId());
-                    if (snap == null) return deny(sender, "Nothing to revert.");
-                    restore(p, snap);
-                    p.sendMessage(Component.text("Reverted to your previous stats (the reroll still counts).", NamedTextColor.YELLOW));
-                }
+                case "keep" -> keepRoll(p);
+                default -> revertRoll(p);
             }
             return true;
         }
@@ -1571,7 +1799,20 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                 if (target != sender) {
                     target.sendMessage(Component.text("An operator rerolled your attributes! Use /gamble to see them.", NamedTextColor.GOLD));
                 }
-                if (sender instanceof Player viewer) openMenu(viewer, target);
+                boolean anim = animationEnabled() && getConfig().getBoolean("animation.admin-rerolls", true);
+                boolean selfView = sender instanceof Player sv && sv.getUniqueId().equals(target.getUniqueId());
+                if (anim) {
+                    Runnable after = () -> { if (selfView) openMenu(target, target); };
+                    if (what.equals("all")) {
+                        playFullRoll(target, after);
+                    } else {
+                        Stat shown = findStat(what);
+                        if (shown != null && shown.linkedTo != null) shown = findStat(shown.linkedTo);
+                        if (shown != null) playReel(target, shown, after);
+                        else after.run();
+                    }
+                }
+                if (sender instanceof Player viewer && !(anim && selfView)) openMenu(viewer, target);
             }
             case "reset" -> {
                 resetPlayer(target);
