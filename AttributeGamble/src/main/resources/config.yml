@@ -5,10 +5,36 @@
 # Auto-gamble players who join the server for the first time.
 gamble-on-first-join: true
 
+# Open the stats menu automatically when a new player first joins.
+menu-on-first-join: true
+
+# Slot-machine / roulette animation when stats are rolled:
+#  - a full roll (first join) spins every stat and stops them one by one
+#  - a single-stat reroll shows one reel that slows down onto the result
+# The result is decided before the animation, it only reveals it.
+animation:
+  enabled: true
+  admin-rerolls: true   # also play it for the player when an operator rerolls them
+
+# Attack knockback and oxygen bonus can't go below 0 in vanilla, so negative
+# rolls are emulated by the plugin:
+#  - negative attack knockback: your melee hits push enemies back less
+#    (cut = |roll| * knockback-cut-per-point, e.g. -1.0 -> 50% less)
+#  - negative oxygen bonus: you lose air faster underwater
+#    (extra air loss per 2 ticks = |roll| * oxygen-drain-per-point, -2 -> twice as fast)
+negative-stats:
+  knockback-cut-per-point: 0.5
+  oxygen-drain-per-point: 1.0
+
 # --- Balance -----------------------------------------------------------
-# Stats are balanced in groups. Within a group the stats' multipliers (weighted
-# by "weight") multiply to 1.00 +/- tolerance, so a lucky stat is paid for by
-# others. Good-low stats (gravity, fall damage, burning time) count inverted.
+# Every stat has exactly 5 possible rolls ("levels", see the stats section),
+# evenly spaced (same gap between each level). The MIDDLE level is the standard
+# (vanilla) value, so an "Average" roll is a normal stat - no built-in buffs.
+# Within a group, the plugin only allows combinations whose weighted product
+# stays within 1.00 +/- tolerance, so a great roll is paid for elsewhere.
+# Good-low stats (gravity, fall damage, burning time) count inverted.
+# NOTE: with only 5 levels per stat, a very small tolerance leaves few valid
+# combinations (more repeats). Raise it for more variety.
 groups:
   combat:
     tolerance: 0.05     # +/-5%
@@ -17,29 +43,29 @@ groups:
   utility:
     tolerance: 0.10     # +/-10%
 
-# "Pity": if the stats rolled so far are low on the good side, later stats and
-# the net of each group are skewed towards better rolls. 0 = off.
+# "Pity": if the stats rolled so far came out poor, later stats and the choice
+# of combination are skewed towards better results. 0 = off.
 pity-strength: 2.0
 
 # --- Fun ---------------------------------------------------------------
-# Jackpot: a small chance that one stat rolls its best possible value. The
-# balance step automatically makes the other stats in its group pay for it.
+# Jackpot: a small chance that one stat rolls its best level. The rest of its
+# group has to pay for it (it is skipped if the group cannot afford it).
 jackpot:
   enabled: true
   chance: 0.03          # 3% per full roll
   broadcast: true
 
-# Archetype titles ("Tank", "Glass Cannon", "Giant Sprinter" ...) shown in
-# /gamble and in the tab list.
+# Archetype titles ("Tank", "Glass Cannon", "Giant Sprinter" ...), coloured.
 titles:
   tab-list: true
+  chat-prefix: true
 
-# Players can reroll a single stat themselves: /gamble roll <stat>
-# They see the new result and can /gamble keep or /gamble revert (clickable).
-# Reverting still uses up the roll and the XP.
+# Anyone can reroll a single stat: shift-click it in /gamble (or /gamble roll <stat>).
+# They see the new result and can keep or revert it. Reverting still uses up
+# the roll and the XP. Remove the gamble.roll permission to turn it off per player.
 player-reroll:
   enabled: true
-  xp-levels: 5
+  xp-levels: 100
   daily-limit: 3        # 0 = unlimited
   decision-seconds: 10
 
@@ -54,20 +80,22 @@ periodic-reroll:
   days: 3
 
 # --- Compensation rules ------------------------------------------------
-# Block interaction range = entity reach + random bonus. If entity reach is
-# above normal (3.0) the bonus is multiplied by above-normal-multiplier.
+# Block interaction range = entity reach + random bonus. Vanilla gap is 1.5
+# (3.0 -> 4.5), so the bonus averages 1.5. If entity reach is above normal (3.0)
+# the bonus is multiplied by above-normal-multiplier (0.5 -> bonus 0.5 to 1.0).
 block-reach-bonus:
-  min: 0.5
-  max: 1.0
+  min: 1.0
+  max: 2.0
   above-normal-multiplier: 0.5
 
 # If max health rolls below the threshold, one of these stats gets a random
-# bonus between min and max (0.10 = +10%).
+# bonus between min and max (0.10 = +10%). For attack_knockback the bonus is
+# converted using that stat's "unit".
 low-health-bonus:
-  threshold: 0.8
+  threshold: 0.85
   min: 0.10
   max: 0.20
-  stats: [attack_damage, attack_speed]
+  stats: [attack_knockback, attack_speed]
 
 # If scale is above 1.0, movement speed gets a bonus on top of its roll.
 scale-speed-bonus:
@@ -82,7 +110,8 @@ scale-tradeoffs:
   small-health-penalty-per-scale: 0.4
 
 # --- Movement ----------------------------------------------------------
-# If the rolled jump can't clear this many blocks, step_height is raised to 1.0.
+# If the rolled jump can't clear this many blocks, step_height is raised to 1.0
+# (not while sneaking).
 min-jump-height: 1.05
 
 # Players with such a weak jump can still build up: sneak, look down and
@@ -91,53 +120,39 @@ pillar-assist:
   enabled: true
   cooldown-ms: 250
 
-# --- Friction ----------------------------------------------------------
-# friction_modifier scales ground friction: higher = you top out slower (snappy,
-# grippy), lower = you slide. The plugin assumes the modifier scales the speed
-# lost each tick and corrects movement speed so a speed roll still feels like a buff.
-#   high-friction: 1.0 = fully cancel the top speed lost to high friction
-#   low-friction : 0.5 = remove half of the free speed from sliding
-# Raise/lower these if it feels too strong or too weak in play. (The formula is
-# a model - I could not test it in-game - so tune these by feel.)
-friction-compensation:
-  high-friction: 1.0
-  low-friction: 0.5
-
-# Open the stats menu automatically when a new player first joins.
-menu-on-first-join: true
-
-# --- Stat ranges -------------------------------------------------------
-# kind MULT: min/max are multipliers of normal (1.0 = normal)
-# entity_interaction_range: ABSOLUTE values (normal = 3.0)
-# kind ADD : min/max are added to normal (oxygen, water efficiency, mining efficiency)
-# good: high | low | center | neutral
-#   center  = best at normal; counts for pity but not group balance
-#   neutral = ignored by balance and pity
-# weight: how much one point of this stat counts in the group balance.
-#   Reach is worth more than most, so it counts double by default.
-# Attributes missing on your server version (e.g. friction_modifier before 26.2)
-# are skipped automatically.
+# --- Stats -------------------------------------------------------------
+# levels: the 5 possible rolls, lowest to highest (rounded numbers).
+#   MULT stats: multipliers of normal (1.0 = normal)
+#   entity_interaction_range: absolute values (normal = 3.0)
+#   ADD stats (attack_knockback, oxygen, water efficiency): added to normal
+# good: high | low | neutral   (neutral = ignored by balance and pity)
+# weight: how much this stat counts in its group's balance (reach counts double).
+# unit (ADD stats with a base of 0): amount that counts as +100% in the balance maths.
+# block_interaction_range is not rolled: it follows entity_interaction_range.
+# Attributes missing on your server version are skipped automatically.
 stats:
   # combat
-  entity_interaction_range: { min: 3.0, max: 5.0, good: high, weight: 2.0 }
-  attack_speed:             { min: 0.6, max: 1.5, good: high }
-  attack_damage:            { min: 0.6, max: 1.5, good: high }
-  max_health:               { min: 0.6, max: 1.5, good: high }
+  entity_interaction_range: { levels: [2.0, 2.5, 3.0, 3.5, 4.0], good: high, weight: 2.0 }
+  attack_speed:             { levels: [0.6, 0.8, 1.0, 1.2, 1.4], good: high }
+  attack_knockback:         { levels: [-1.0, -0.5, 0.0, 0.5, 1.0], good: high, unit: 4.0 }   # negatives are emulated
+  max_health:               { levels: [0.6, 0.8, 1.0, 1.2, 1.4], good: high }
 
   # mobility
-  gravity:                  { min: 0.4,  max: 1.6, good: low }
-  jump_strength:            { min: 0.3,  max: 1.8, good: high }
-  movement_speed:           { min: 0.6,  max: 1.5, good: high }
-  friction_modifier:        { min: 0.8,  max: 1.2, good: center }
-  scale:                    { min: 0.75, max: 1.25, good: neutral }
+  gravity:                  { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: low }
+  jump_strength:            { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: high }
+  movement_speed:           { levels: [0.6, 0.8, 1.0, 1.2, 1.4], good: high }
+  # Smallest scale 0.6: sneaking height 1.5 * 0.6 = 0.9, so a Tiny player fits under a 1-block gap.
+  # "Tiny" / "Giant" titles are only given for the smallest / largest level.
+  scale:                    { levels: [0.6, 0.8, 1.0, 1.2, 1.4], good: neutral }
 
   # utility quirks
-  safe_fall_distance:       { min: 0.5, max: 2.0, good: high }
-  fall_damage_multiplier:   { min: 0.5, max: 1.5, good: low }
-  burning_time:             { min: 0.5, max: 1.5, good: low }
-  sneaking_speed:           { min: 0.6, max: 1.5, good: high }
+  safe_fall_distance:       { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: high }
+  fall_damage_multiplier:   { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: low }
+  burning_time:             { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: low }
+  sneaking_speed:           { levels: [0.6, 0.8, 1.0, 1.2, 1.4], good: high }
 
   # independent
-  mining_efficiency:         { min: 0.0, max: 1.5, good: high }
-  oxygen_bonus:              { min: 0.0, max: 5.0, good: high }
-  water_movement_efficiency: { min: 0.0, max: 1.0, good: high }   # vanilla caps this at 1.0
+  block_break_speed:         { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: high }
+  oxygen_bonus:              { levels: [-2.0, -1.0, 0.0, 1.0, 2.0], good: high }              # negatives are emulated
+  # replaces water_movement_efficiency, which can't be rolled below vanilla
+  submerged_mining_speed:    { levels: [0.5, 0.75, 1.0, 1.25, 1.5], good: high }

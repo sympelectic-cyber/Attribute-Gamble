@@ -13,8 +13,8 @@ permissions:
     description: View your own stats and power
     default: true
   gamble.roll:
-    description: Reroll stats (menu shift-click, /gamble roll, keep, revert) - operators only by default
-    default: op
+    description: Reroll a stat (menu shift-click, /gamble roll, keep, revert)
+    default: true
   gamble.admin:
     description: Reroll, reset, reload and view other players
     default: op
