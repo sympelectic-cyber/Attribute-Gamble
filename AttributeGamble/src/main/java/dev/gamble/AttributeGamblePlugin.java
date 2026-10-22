@@ -141,7 +141,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                     new String[]{"gravity", "jump_strength", "movement_speed", "scale"}),
             new GroupLayout("Utility", NamedTextColor.YELLOW, 27, new int[]{28, 29, 30, 31},
                     new String[]{"safe_fall_distance", "fall_damage_multiplier", "burning_time", "sneaking_speed"}),
-            new GroupLayout("Other", NamedTextColor.AQUA, 32, new int[]{33, 34, 35},
+            new GroupLayout("Other", NamedTextColor.AQUA, 36, new int[]{37, 38, 39},
                     new String[]{"block_break_speed", "oxygen_bonus", "submerged_mining_speed"}));
 
     private static final Material[] PANES = {
@@ -192,6 +192,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private static final String STEP_ID = "step_height";
     private static final String SCALE_BONUS_ID = "scale_speed_bonus";
     private static final String LOW_HP_ID = "low_health_bonus";
+    private static final String JUMP_FALL_ID = "jump_safe_fall";
 
     private final List<Stat> stats = new ArrayList<>();
     private final Map<UUID, Snapshot> pending = new HashMap<>();
@@ -584,7 +585,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private void applyStat(Player p, Stat s, double v) {
         AttributeInstance inst = p.getAttribute(s.attr);
         if (inst == null) return;
-        v = Math.max(s.lo(), Math.min(s.hi(), v));
+        v = Math.max(extLo(s), Math.min(extHi(s), v));
         v = Math.round(v * 1000.0) / 1000.0;
 
         NamespacedKey key = keyFor(s.id);
@@ -624,6 +625,19 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     private int quality(Stat s, int idx) {
         if (Math.abs(s.levels[idx] - s.levels[LEVELS / 2]) < 1e-9) return LEVELS / 2;
         return s.good == Good.LOW ? (LEVELS - 1 - idx) : idx;
+    }
+
+    /** One step beyond the lowest / highest level (same gap as between levels). Used by jackpot rolls. */
+    private double extHi(Stat s) {
+        return s.hi() + (s.levels[LEVELS - 1] - s.levels[LEVELS - 2]);
+    }
+
+    private double extLo(Stat s) {
+        return s.lo() - (s.levels[1] - s.levels[0]);
+    }
+
+    private double jackpotValue(Stat s) {
+        return s.good == Good.LOW ? extLo(s) : extHi(s);
     }
 
     private boolean sameLevel(Stat s, int a, int b) {
@@ -674,14 +688,15 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
      * combos that change fewer other stats are preferred and the target stat should change.
      * Returns null if no combination qualifies.
      */
-    private int[] pickCombo(Player p, List<Stat> members, double tol, int[] fixed, double pity, int[] current, int target) {
+    private int[] pickCombo(Player p, List<Stat> members, double tol, int[] fixed, double pity, int[] current, int target,
+                            int jpPos, double jpVal) {
         int n = members.size();
         double[][] x = new double[n][LEVELS];
         for (int i = 0; i < n; i++) {
             Stat st = members.get(i);
             double base = baseOf(p, st);
             for (int l = 0; l < LEVELS; l++) {
-                x[i][l] = st.weight * st.sign() * ln(1.0 + devOf(st, st.levels[l], base));
+                x[i][l] = st.weight * st.sign() * ln(1.0 + devOf(st, (i == jpPos) ? jpVal : st.levels[l], base));
             }
         }
         double limit = Math.log(1.0 + tol);
@@ -789,11 +804,12 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             boolean hasJackpot = jackpot != null && group.equals(jackpot.group);
             if (hasJackpot) fixed[mem.indexOf(jackpot)] = bestIdx(jackpot);
 
-            int[] pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1);
+            int[] pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1,
+                    hasJackpot ? mem.indexOf(jackpot) : -1, hasJackpot ? jackpotValue(jackpot) : 0.0);
             if (pick == null && hasJackpot) { // the group cannot afford this jackpot
                 jackpot = null;
                 Arrays.fill(fixed, -1);
-                pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1);
+                pick = pickCombo(p, mem, tolerance(group), fixed, pity, null, -1, -1, 0.0);
             }
             if (pick == null) {
                 pick = new int[mem.size()];
@@ -806,7 +822,11 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             }
         }
 
-        for (var e : picked.entrySet()) applyStat(p, e.getKey(), e.getKey().levels[e.getValue()]);
+        Stat jp = jackpot;
+        for (var e : picked.entrySet()) {
+            Stat s = e.getKey();
+            applyStat(p, s, s == jp ? jackpotValue(s) : s.levels[e.getValue()]);
+        }
         rerollLinkOffsets(p);
         clearLowHealthChoice(p);
 
@@ -816,7 +836,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         finish(p);
 
         if (jackpot != null) {
-            p.sendMessage(Component.text("JACKPOT! " + pretty(jackpot.id) + " rolled its best possible level (the others paid for it).",
+            p.sendMessage(Component.text("JACKPOT! " + pretty(jackpot.id) + " rolled beyond its normal range (the others paid for it).",
                     NamedTextColor.LIGHT_PURPLE));
             if (getConfig().getBoolean("jackpot.broadcast", true)) {
                 Bukkit.getServer().broadcast(Component.text(p.getName() + " hit the JACKPOT on " + pretty(jackpot.id) + "!",
@@ -841,7 +861,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             List<Stat> mem = members(st.group);
             int[] cur = new int[mem.size()];
             for (int i = 0; i < cur.length; i++) cur[i] = nearestIdx(mem.get(i), current(p, mem.get(i)));
-            int[] pick = pickCombo(p, mem, tolerance(st.group), null, pity, cur, mem.indexOf(st));
+            int[] pick = pickCombo(p, mem, tolerance(st.group), null, pity, cur, mem.indexOf(st), -1, 0.0);
             if (pick == null) {
                 rollAll(p);
                 return;
@@ -873,6 +893,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         applyScaleBonus(p);
         applyScaleTradeoffs(p);
         applyLowHealthBonus(p);
+        applyJumpSafeFall(p);
         fixJump(p);
         applyTitle(p);
         updateNegatives(p);
@@ -955,11 +976,22 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         Attribute kb = Registry.ATTRIBUTE.get(NamespacedKey.minecraft("knockback_resistance"));
         Stat hp = findStat("max_health");
         removeMod(p, kb, "scale_kb");
-        if (hp != null) removeMod(p, hp.attr, "scale_hp");
+        if (hp != null) {
+            removeMod(p, hp.attr, "scale_hp");
+            removeMod(p, hp.attr, "giant_hp");
+        }
 
         Stat sc = findStat("scale");
         if (sc == null || sc.attr == null) return;
         double s = current(p, sc);
+
+        if (isRolled(p, sc) && nearestIdx(sc, s) == LEVELS - 1 && hp != null && hp.attr != null) {
+            AttributeInstance inst = p.getAttribute(hp.attr);
+            double bonus = getConfig().getDouble("scale-tradeoffs.giant-health-bonus", 0.20);
+            if (inst != null && bonus > 0) {
+                inst.addModifier(new AttributeModifier(keyFor("giant_hp"), bonus, AttributeModifier.Operation.ADD_SCALAR));
+            }
+        }
 
         if (s > 1.0 && kb != null) {
             AttributeInstance inst = p.getAttribute(kb);
@@ -1035,6 +1067,32 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         }
     }
 
+    /**
+     * With a jump boost (jump strength above normal), fall damage only starts after your jump height + 3 blocks
+     * (at least; a better safe-fall roll still counts).
+     */
+    private void applyJumpSafeFall(Player p) {
+        Attribute fallAttr = Registry.ATTRIBUTE.get(NamespacedKey.minecraft("safe_fall_distance"));
+        if (fallAttr == null) return;
+        AttributeInstance fall = p.getAttribute(fallAttr);
+        if (fall == null) return;
+        removeMod(p, fallAttr, JUMP_FALL_ID);
+
+        Stat g = findStat("gravity"), j = findStat("jump_strength");
+        if (g == null || j == null || g.attr == null || j.attr == null || !isRolled(p, j)) return;
+        if (current(p, j) <= 1.0) return;
+        AttributeInstance gi = p.getAttribute(g.attr), ji = p.getAttribute(j.attr);
+        if (gi == null || ji == null) return;
+
+        double need = jumpPeak(gi.getValue(), ji.getValue()) + getConfig().getDouble("jump-safe-fall.extra-blocks", 3.0);
+        double base = fall.getBaseValue();
+        double now = fall.getValue();
+        if (now <= 0 || base <= 0 || need <= now) return;
+        // final = (base + add) * (now / base)  ->  solve for add
+        double add = need * base / now - base;
+        fall.addModifier(new AttributeModifier(keyFor(JUMP_FALL_ID), add, AttributeModifier.Operation.ADD_NUMBER));
+    }
+
     // ------------------------------------------------------------------ jump guarantee
 
     private double jumpPeak(double gravity, double jump) {
@@ -1079,27 +1137,22 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
     }
 
     /**
-     * Archetype title. Looks at the player's strongest and weakest stats (group stats by their balanced weight,
-     * independent stats like oxygen / block break speed by their level) and names the build.
+     * Archetype title. Only the main combat and mobility stats can earn one, and only when that stat is
+     * clearly strong (titles.min-strength). Utility quirks and independent stats never give a title.
      */
     private String computeTitle(Player p) {
+        double minStrength = getConfig().getDouble("titles.min-strength", 0.15);
         Stat dom = null, worst = null;
         double domX = 0, worstX = 0;
         for (Stat s : stats) {
-            if (s.attr == null || s.linkedTo != null || s.good == Good.NEUTRAL) continue;
-            double x;
-            if (s.counted()) {
-                x = s.weight * s.sign() * ln(1.0 + devOf(s, current(p, s), baseOf(p, s)));
-                if (worst == null || x < worstX) { worst = s; worstX = x; }
-            } else {
-                if (!isRolled(p, s)) continue;
-                x = (quality(s, nearestIdx(s, current(p, s))) - 2) * 0.15;
-            }
+            if (!s.counted() || !("combat".equals(s.group) || "mobility".equals(s.group))) continue;
+            double x = s.weight * s.sign() * ln(1.0 + devOf(s, current(p, s), baseOf(p, s)));
+            if (worst == null || x < worstX) { worst = s; worstX = x; }
             if (dom == null || x > domX) { dom = s; domX = x; }
         }
 
         String name;
-        if (dom == null || domX < 0.06) {
+        if (dom == null || domX < minStrength) {
             name = "Everyman";
         } else {
             String top = dom.id;
@@ -1122,12 +1175,6 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
                     case "gravity" -> "Featherweight";
                     case "jump_strength" -> "Leaper";
                     case "movement_speed" -> "Sprinter";
-                    case "safe_fall_distance" -> "Acrobat";
-                    case "fall_damage_multiplier" -> "Stuntman";
-                    case "burning_time" -> "Fireproof";
-                    case "sneaking_speed" -> "Shadow";
-                    case "block_break_speed" -> "Digger";
-                    case "oxygen_bonus", "submerged_mining_speed" -> "Diver";
                     default -> "Wanderer";
                 };
             }
@@ -1379,6 +1426,9 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
             }
         }
 
+        String jpStat = target.getPersistentDataContainer().get(keyFor("jackpot_stat"), PersistentDataType.STRING);
+        if (s.id.equals(jpStat)) lore.add(line("JACKPOT - beyond the normal range", NamedTextColor.LIGHT_PURPLE));
+
         if (admin) {
             AttributeInstance inst = target.getAttribute(s.attr);
             if (inst != null) {
@@ -1626,7 +1676,7 @@ public class AttributeGamblePlugin extends JavaPlugin implements TabExecutor, Li
         inv.setItem(4, icon(Material.YELLOW_STAINED_GLASS_PANE, line("\u25BC", NamedTextColor.YELLOW), null));
         inv.setItem(22, icon(Material.YELLOW_STAINED_GLASS_PANE, line("\u25B2", NamedTextColor.YELLOW), null));
         Material mat = Material.matchMaterial(ICONS.getOrDefault(s.id, "PAPER"));
-        inv.setItem(13 - 9, icon(mat == null ? Material.PAPER : mat, line(pretty(s.id), NamedTextColor.WHITE), null));
+        inv.setItem(0, icon(mat == null ? Material.PAPER : mat, line(pretty(s.id), NamedTextColor.WHITE), null));
 
         int total = 36;
         int[] strip = new int[total];
