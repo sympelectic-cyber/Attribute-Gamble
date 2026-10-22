@@ -48,8 +48,9 @@ groups:
 pity-strength: 2.0
 
 # --- Fun ---------------------------------------------------------------
-# Jackpot: a small chance that one stat rolls its best level. The rest of its
-# group has to pay for it (it is skipped if the group cannot afford it).
+# Jackpot: a small chance that one stat rolls ONE STEP BEYOND its best level
+# (higher than any normal roll). The rest of its group has to pay for it
+# (it is skipped if the group cannot afford it).
 jackpot:
   enabled: true
   chance: 0.03          # 3% per full roll
@@ -59,6 +60,9 @@ jackpot:
 titles:
   tab-list: true
   chat-prefix: true
+  # Only the main combat + mobility stats can earn a title, and only when that
+  # stat is clearly strong. Higher = harder to earn (0.15 is roughly "Good" level).
+  min-strength: 0.15
 
 # Anyone can reroll a single stat: shift-click it in /gamble (or /gamble roll <stat>).
 # They see the new result and can keep or revert it. Reverting still uses up
@@ -108,8 +112,14 @@ scale-speed-bonus:
 scale-tradeoffs:
   knockback-resistance-per-scale: 0.8
   small-health-penalty-per-scale: 0.4
+  giant-health-bonus: 0.20      # Giant (largest scale level): +20% max health
 
 # --- Movement ----------------------------------------------------------
+# With a jump boost (jump strength above normal), fall damage only starts after
+# your jump height + this many blocks (a better safe_fall_distance roll still counts).
+jump-safe-fall:
+  extra-blocks: 3.0
+
 # If the rolled jump can't clear this many blocks, step_height is raised to 1.0
 # (not while sneaking).
 min-jump-height: 1.05
@@ -124,7 +134,7 @@ pillar-assist:
 # levels: the 5 possible rolls, lowest to highest (rounded numbers).
 #   MULT stats: multipliers of normal (1.0 = normal)
 #   entity_interaction_range: absolute values (normal = 3.0)
-#   ADD stats (attack_knockback, oxygen, water efficiency): added to normal
+#   ADD stats (attack_knockback, oxygen_bonus): added to normal (negatives are emulated, see negative-stats)
 # good: high | low | neutral   (neutral = ignored by balance and pity)
 # weight: how much this stat counts in its group's balance (reach counts double).
 # unit (ADD stats with a base of 0): amount that counts as +100% in the balance maths.
